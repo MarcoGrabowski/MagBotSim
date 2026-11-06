@@ -32,7 +32,7 @@ as product transport and processing steps can be carried out simultaneously, e.g
 mixing liquids during transport. Therefore, the application of reconfigurable MagBots significantly reduces the costs and
 footprint of a machine, offering a cost-effective alternative to traditional machines that rely on feeding mechanisms.
 
-The MuJoCo models and the inverse kinematics controllers of the following MagBots are currently integrated into MagBotSim:
+The MuJoCo models, the inverse kinematics controllers, and the forward kinematics of the following MagBots are currently integrated into MagBotSim:
 
 .. toctree::
    :maxdepth: 1

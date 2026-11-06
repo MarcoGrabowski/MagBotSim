@@ -73,8 +73,12 @@ class GripperMagBotsAPM4330:
         self.gripper_pad_1_geom_names = [f'gripper_pad_1_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
         self.gripper_pad_2_geom_names = [f'gripper_pad_2_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
         # calibration mapping between the finger distance and the finger (jaw) angle, built in update_cached_mujoco_data
+        # (ordered by ascending distance, used by finger_distance_to_angle)
         self._finger_distance_grid = None
         self._finger_angle_grid = None
+        # same calibration, ordered by ascending angle (used by finger_angle_to_distance)
+        self._finger_angle_grid_by_angle = None
+        self._finger_distance_grid_by_angle = None
         self.finger_distance_min = None
         self.finger_distance_max = None
 
@@ -134,12 +138,26 @@ class GripperMagBotsAPM4330:
         finally:
             model.opt.gravity[:] = gravity
 
-        # store the samples ordered by ascending distance (required by np.interp in finger_distance_to_angle)
+        self._set_finger_calibration(finger_distances=finger_distances, finger_angles=finger_angles)
+
+    def _set_finger_calibration(self, finger_distances: np.ndarray, finger_angles: np.ndarray) -> None:
+        """Store the calibration samples of the mapping between the finger distance and the finger (jaw) angle. The samples are sorted
+        once here (np.interp requires ascending sample points), so that ``finger_distance_to_angle`` and ``finger_angle_to_distance``
+        do not need to sort on every call.
+
+        :param finger_distances: the distances between the finger pads in m. Shape: (num_calib_samples,)
+        :param finger_angles: the corresponding finger (jaw) angles in rad. Shape: (num_calib_samples,)
+        """
+        # ordered by ascending distance (finger_distance_to_angle)
         order = np.argsort(finger_distances)
         self._finger_distance_grid = finger_distances[order]
         self._finger_angle_grid = finger_angles[order]
         self.finger_distance_min = float(self._finger_distance_grid[0])
         self.finger_distance_max = float(self._finger_distance_grid[-1])
+        # ordered by ascending angle (finger_angle_to_distance)
+        order = np.argsort(finger_angles)
+        self._finger_angle_grid_by_angle = finger_angles[order]
+        self._finger_distance_grid_by_angle = finger_distances[order]
 
     def finger_distance_to_angle(self, finger_distance: np.ndarray) -> np.ndarray:
         """Convert a desired distance between the two finger pads to the corresponding finger (jaw) angle.
@@ -157,6 +175,26 @@ class GripperMagBotsAPM4330:
 
         clipped_distance = np.clip(finger_distance, self._finger_distance_grid[0], self._finger_distance_grid[-1])
         return np.interp(clipped_distance, self._finger_distance_grid, self._finger_angle_grid)
+
+    def finger_angle_to_distance(self, finger_angle: np.ndarray) -> np.ndarray:
+        """Convert a finger (jaw) angle to the corresponding distance between the two finger pads, i.e. the inverse of
+        ``finger_distance_to_angle``.
+
+        The finger angle is clipped to the calibrated finger angle range.
+
+        :param finger_angle: the finger (jaw) angle(s) in rad. Shape: (num_samples,)
+        :return: the corresponding distance(s) between the finger pads in m. Shape: (num_samples,)
+        """
+        angle_grid = self._finger_angle_grid_by_angle
+        distance_grid = self._finger_distance_grid_by_angle
+        if angle_grid is None or distance_grid is None:
+            raise RuntimeError(
+                'Finger distance calibration is not available. Call update_cached_mujoco_data(model) before using '
+                'finger_angle_to_distance or moverSetPose2GripperSetPose.'
+            )
+
+        clipped_angle = np.clip(finger_angle, angle_grid[0], angle_grid[-1])
+        return np.interp(clipped_angle, angle_grid, distance_grid)
 
     def _update_cached_gripper_qpos_indices(self, model: MjModel) -> None:
         """Update gripper qpos indices.
@@ -1153,6 +1191,62 @@ class GripperMagBotsAPM4330:
         mover_pose_euler_d[:, 2, 5] = c_m2
 
         return mover_pose_euler_d
+
+    def moverSetPose2GripperSetPose(self, mover_poses: np.ndarray) -> np.ndarray:
+        """Calculate the gripper pose from the mover poses (forward kinematics), i.e. the inverse of ``gripperSetPose2MoverSetPose``.
+        This method is vectorized and can therefore calculate gripper poses for multiple MagBots.
+
+        .. note::
+            This method is the purely geometric calculation of the MagBot's mechanics, i.e. it returns the gripper pose that results
+            from the given mover poses under the assumption of an ideal, rigid mechanism. This is not the same as the gripper pose
+            returned by ``get_gripper_pose``, which is measured in the simulation and therefore influenced by the movers' impedance
+            controllers, the compliance of the mechanism, and contacts.
+
+        The mover c-rotations must be specified as continuous Euler angles, as returned by ``gripperSetPose2MoverSetPose``, i.e. they
+        must not be wrapped to (-pi, pi], e.g. as a result of a conversion from quaternions. The calculated gripper c-rotation is in
+        (-pi, pi]. The finger distance calibration must be available, i.e. ``update_cached_mujoco_data`` must have been called.
+
+        :param mover_poses: the mover poses (rotation specified as Euler angles (xyz) in rad). Shape: (num_samples,3,6)
+            [:,0,:]: poses for the mover attached to connection 0; [:,1,:]: poses for the mover attached to connection 1;
+            [:,2,:]: poses for the mover attached to connection 2
+        :return: the gripper poses (rotation specified as Euler angles (xyz) in rad). Shape: (num_samples,7)
+            (representation: (x,y,z,a,b,c,finger_distance)). The 7th entry is the distance between the two finger pads in m.
+        """
+        p = self.magbot_params
+        xy_m0 = mover_poses[:, 0, :2]
+        xy_m1 = mover_poses[:, 1, :2]
+        c_m0 = mover_poses[:, 0, 5]
+        c_m1 = mover_poses[:, 1, 5]
+        c_m2 = mover_poses[:, 2, 5]
+        z_m = 0.5 * (mover_poses[:, 0, 2] + mover_poses[:, 1, 2])
+
+        # distance between mover 0 and mover 1
+        d_m01 = np.linalg.norm(xy_m0 - xy_m1, ord=2, axis=1)
+
+        # platform xyz-pos
+        x_p = 0.5 * (xy_m0[:, 0] + xy_m1[:, 0])
+        y_p = 0.5 * (xy_m0[:, 1] + xy_m1[:, 1])
+        z_p = p.z_b01 + p.z_t01 + np.sqrt(np.power(p.k_01, 2) - np.power(d_m01 / 2 - p.x_b01 - p.x_t01, 2))
+
+        # gripper rotations
+        a = -0.5 * (c_m0 / p.s_m0 - c_m1 / p.s_m1)
+        c = np.arctan2(xy_m1[:, 1] - y_p, xy_m1[:, 0] - x_p)
+        b = a - (c_m1 - c) / p.s_m1
+
+        # gripper finger: finger (jaw) angle -> distance between the finger pads
+        f_angle = (c_m2 - a - c) / p.s_m2
+        f = self.finger_angle_to_distance(f_angle)
+
+        gripper_pose = np.zeros((mover_poses.shape[0], 7))
+        gripper_pose[:, 0] = x_p - p.n * np.abs(np.sin(a)) * np.sin(c)
+        gripper_pose[:, 1] = y_p + p.n * np.abs(np.sin(a)) * np.cos(c)
+        gripper_pose[:, 2] = z_p + z_m + p.n * np.cos(a)
+        gripper_pose[:, 3] = a
+        gripper_pose[:, 4] = b
+        gripper_pose[:, 5] = c
+        gripper_pose[:, 6] = f
+
+        return gripper_pose
 
     def get_gripper_pose(self, model: MjModel, data: MjData, indices_magbots: np.ndarray) -> np.ndarray:
         """Get the current pose of a MagBot's gripper (measured at the center between the two gripper fingers), including the current

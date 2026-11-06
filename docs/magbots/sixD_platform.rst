@@ -41,7 +41,7 @@ couples two movers into a composite robotic platform. The 6D-Platform MagBot is 
 compatible with all industrial MagLev systems. Additionally, the MagBot can be autonomously dropped off or 
 picked up by the movers using a docking station. The platform of the MagBot is controlled by the x-, y-, and :math:`\gamma`-axes of the movers.
 To enable the development of motion planning approaches for Magnetic Robotics, a MuJoCo model of the 6D-Platform MagBot 
-is integrated in the MagBotSim together with the inverse kinematics controller.
+is integrated in the MagBotSim together with the inverse kinematics controller and the forward kinematics.
 
 The 6D-Platform MagBot was introduced in our paper `From Transportation to Manipulation: Transforming Magnetic Levitation to Magnetic Robotics <https://doi.org/10.48550/arXiv.2603.01982>`_.
 

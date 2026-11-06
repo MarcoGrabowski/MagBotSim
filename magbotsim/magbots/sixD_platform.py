@@ -27,6 +27,11 @@ class SixDPlatformMagBotsAPM4330:
         self.min_dist_movers_m = 0.258  # in m
         self.max_dist_movers_m = 0.455  # in m
 
+        # geometry of the scissor mechanism (relation between mover distance and platform z-position), in m
+        self.mover_dist_offset_m = 0.091  # half mover distance offset
+        self.link_length_m = 0.156  # length of the connection links
+        self.platform_z_offset_m = 0.1278  # z-offset between mover and platform
+
         # gear ratios
         self.gear_ratio_mover2platform_a = 0.119
         self.gear_ratio_mover2platform_b = 0.131
@@ -601,7 +606,9 @@ class SixDPlatformMagBotsAPM4330:
         :return: the desired mover distances. Shape: (num_samples,) or (num_samples,1) depending on the input shapes
         """
         assert platform_z_d.shape == mover_z_d.shape
-        mover_dist_d = 2 * (0.091 + np.sqrt(0.156**2 - np.power((platform_z_d - mover_z_d - 0.1278), 2)))
+        mover_dist_d = 2 * (
+            self.mover_dist_offset_m + np.sqrt(self.link_length_m**2 - np.power((platform_z_d - mover_z_d - self.platform_z_offset_m), 2))
+        )
         mask_less_than_min = mover_dist_d < self.min_dist_movers_m
         mask_greater_than_max = mover_dist_d > self.max_dist_movers_m
 
@@ -620,6 +627,20 @@ class SixDPlatformMagBotsAPM4330:
             )
 
         return mover_dist_d
+
+    def moverDist2PlatformZPos(self, mover_dist: np.ndarray, mover_z: np.ndarray) -> np.ndarray:
+        """Calculate the platform z-position from the distance between the two movers, i.e. the inverse of ``platformZPos2MoverDist``.
+        This method is vectorized and can therefore calculate platform z-positions for multiple MagBots. The mover distances are
+        clipped to the minimum and maximum possible mover distances.
+
+        :param mover_dist: the distances between the two movers of each MagBot (projection to the x,y-plane).
+            Shape: (num_samples,) or (num_samples,1)
+        :param mover_z: the mover z-pos (corresponds to the distance between the tile surface and the bottom of a mover).
+            Shape: (num_samples,) or (num_samples,1)
+        :return: the platform z-positions. Shape: (num_samples,) or (num_samples,1) depending on the input shapes
+        """
+        mover_dist = np.clip(mover_dist, self.min_dist_movers_m, self.max_dist_movers_m)
+        return mover_z + self.platform_z_offset_m + np.sqrt(self.link_length_m**2 - np.power(mover_dist / 2 - self.mover_dist_offset_m, 2))
 
     def platformSetPose2MoverSetPose(
         self, platform_pose_d: np.ndarray, mover_z_d: np.ndarray | float, use_euler: bool = False
@@ -671,6 +692,60 @@ class SixDPlatformMagBotsAPM4330:
             return mover_pose_quat_d
         else:
             return mover_pose_euler_d
+
+    def moverSetPose2PlatformSetPose(self, mover_poses: np.ndarray, use_euler: bool = False) -> np.ndarray:
+        """Calculate the platform pose from the mover poses (forward kinematics), i.e. the inverse of ``platformSetPose2MoverSetPose``.
+        This method is vectorized and can therefore calculate platform poses for multiple MagBots.
+
+        .. note::
+            This method is the purely geometric calculation of the MagBot's mechanics, i.e. it returns the platform pose that results
+            from the given mover poses under the assumption of an ideal, rigid mechanism. This is not the same as the platform pose
+            returned by ``get_platform_pose``, which is measured in the simulation and therefore influenced by the movers' impedance
+            controllers, the compliance of the mechanism, and contacts.
+
+        The platform pose is determined by the x,y-positions and the c-rotations (rotation around the z-axis) of the two movers.
+        The mean z-position of the two movers is used as the mover flight altitude. The mover distance is clipped to the minimum and
+        maximum possible mover distances, and the platform's a- and b-rotations are clipped to the maximum platform rotation
+        (``max_platform_rot_ab``). The calculated platform c-rotation is in (-pi, pi].
+
+        :param mover_poses: the mover poses. Shape: if ``use_euler==True``: (num_samples,2,6) (rotation specified as Euler angles (xyz)
+            in rad), else: (num_samples,2,7) (rotation specified as quaternions (w,x,y,z)).
+            [:,0,:]: poses for the mover that controls the platform's alpha-rotation; [:,1,:]: poses for the mover that controls the
+            platform's beta-rotation
+        :param use_euler: whether the mover rotations are represented as quaternions (w,x,y,z) or euler angles (xyz), defaults
+            to False
+        :return: the platform poses (rotation specified as Euler angles (xyz) in rad). Shape: (num_samples,6)
+            (representation: (x,y,z,a,b,c))
+        """
+        num_samples = mover_poses.shape[0]
+
+        if use_euler:
+            c_m = mover_poses[:, :, 5]
+        else:
+            c_m = rotations_utils.vec_quat2euler(mover_poses[:, :, 3:].reshape((-1, 4)))[:, 2].reshape((num_samples, 2))
+
+        xy_m_a = mover_poses[:, 0, :2]
+        xy_m_b = mover_poses[:, 1, :2]
+        mover_z = 0.5 * (mover_poses[:, 0, 2] + mover_poses[:, 1, 2])
+
+        platform_pose = np.zeros((num_samples, 6))
+        # platform xyz-pos
+        platform_pose[:, :2] = 0.5 * (xy_m_a + xy_m_b)
+        mover_dist = np.linalg.norm(xy_m_b - xy_m_a, ord=2, axis=1)
+        platform_pose[:, 2] = self.moverDist2PlatformZPos(mover_dist=mover_dist, mover_z=mover_z)
+
+        # platform c-rot (the mover that controls the beta-rotation is located in the direction of the platform's c-rotation)
+        c = np.arctan2(xy_m_b[:, 1] - platform_pose[:, 1], xy_m_b[:, 0] - platform_pose[:, 0])
+        platform_pose[:, 5] = c
+
+        # platform a,b-rot; the difference between mover and platform c-rotation is wrapped to (-pi, pi], which is valid as long as
+        # the platform rotations are within the mechanical limits (max. mover rotation relative to the platform < pi)
+        rel_c_m_a = np.angle(np.exp(1j * (c_m[:, 0] - c)))
+        rel_c_m_b = np.angle(np.exp(1j * (c_m[:, 1] - c)))
+        platform_pose[:, 3] = np.clip(-self.gear_ratio_mover2platform_a * rel_c_m_a, -self.max_platform_rot_ab, self.max_platform_rot_ab)
+        platform_pose[:, 4] = np.clip(-self.gear_ratio_mover2platform_b * rel_c_m_b, -self.max_platform_rot_ab, self.max_platform_rot_ab)
+
+        return platform_pose
 
     def get_platform_pose(self, model: MjModel, data: MjData, indices_magbots: np.ndarray) -> np.ndarray:
         """Get the current pose of a MagBot's platform (measured at the center of the platform's surface). This method is vectorized

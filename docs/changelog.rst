@@ -1,6 +1,15 @@
 Changelog
 =========
 
+Upcoming Release
+----------------
+
+General
+^^^^^^^
+1. Add forward kinematics for the Gripper MagBot (``moverSetPose2GripperSetPose``) and the 6D-Platform MagBot
+   (``moverSetPose2PlatformSetPose``)
+2. Add ``finger_angle_to_distance`` (Gripper MagBot) and ``moverDist2PlatformZPos`` (6D-Platform MagBot)
+
 Release v1.3.0 (2026-09-11)
 ---------------------------
 

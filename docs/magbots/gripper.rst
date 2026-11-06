@@ -12,7 +12,7 @@ the Gripper MagBot has been developed - a low-cost parallel 6-DoF manipulator wi
 The Gripper MagBot is designed to be compatible with all industrial MagLev systems. Additionally, the MagBot can be autonomously dropped off or 
 picked up by the movers using a docking station. The gripper of the MagBot is controlled by the x-, y-, and :math:`\gamma`-axes of the movers.
 To enable the development of motion planning approaches for Magnetic Robotics, a MuJoCo model of the Gripper MagBot 
-is integrated in the MagBotSim together with the inverse kinematics controller.
+is integrated in the MagBotSim together with the inverse kinematics controller and the forward kinematics.
 
 API References
 --------------
