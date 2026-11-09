@@ -27,6 +27,12 @@ class MoverImpedanceController:
         is specified, the same stiffness value is used for all rotational axes.
     :param pose_err_scale: the scaling factors for the pose error, can be either a single float (same values for all error dimensions)
             or a numpy array of shape (6,1) or (6,) containing values for each error dimension (order: pos error x,y,z, rot error a,b,c)
+    :param rotational_damping_from_inertia: whether to compute the rotational damping from the rotational inertia of the mover body
+        instead of the mover mass, defaults to False. If False, the damping of all DoFs is computed from the mover mass (and the
+        additional mass). If True, only the translational damping is computed from the mass, whereas the rotational damping is computed
+        from the moments of inertia of the mover body about the axes of the mover frame, i.e. the rotational DoFs are critically
+        damped. This is required for stability if the rotational stiffness is large compared to the rotational inertia of the mover,
+        since the mass-based damping is several orders of magnitude too large for the rotational DoFs.
     """
 
     def __init__(
@@ -38,6 +44,7 @@ class MoverImpedanceController:
         translational_stiffness: np.ndarray | float = 1.0,
         rotational_stiffness: np.ndarray | float = 0.1,
         pose_err_scale: np.ndarray | float = 1.0,
+        rotational_damping_from_inertia: bool = False,
     ) -> None:
         # mover data
         self.mover_joint_name = mover_joint_name
@@ -52,8 +59,10 @@ class MoverImpedanceController:
         self.stiffness[:3, :3] = self._init_stiffness_mat(stiffness=translational_stiffness)
         self.stiffness[-3:, -3:] = self._init_stiffness_mat(stiffness=rotational_stiffness)
         # configure damping matrix (damping ratio = 1)
+        self.rotational_damping_from_inertia = rotational_damping_from_inertia
         self.mover_mass = model.body(self.mover_body_id).subtreemass[0]
-        self.damping = 2 * np.sqrt(self.stiffness * self.mover_mass)
+        self.mover_inertia = self._get_mover_inertia(model)
+        self._init_damping()
 
         # enable/disable joints
         if joint_mask is None:
@@ -90,6 +99,40 @@ class MoverImpedanceController:
             assert isinstance(stiffness, np.ndarray)
             assert stiffness.shape == (3,)
             return np.diag(stiffness)
+
+    def _get_mover_inertia(self, model: MjModel) -> np.ndarray:
+        """Return the moments of inertia of the mover body about the axes of the mover frame. MuJoCo stores the principal moments of
+        inertia in the principal axes frame (body_iquat), which is not necessarily aligned with the mover frame.
+
+        :param model: mjModel of the MuJoCo environment
+        :return: the diagonal of the inertia tensor in the mover frame, i.e. a numpy array of shape (3,) (order: a, b, c)
+        """
+        rot_mat = np.zeros(9)
+        mujoco.mju_quat2Mat(rot_mat, model.body_iquat[self.mover_body_id])
+        rot_mat = rot_mat.reshape((3, 3))
+        return np.diag(rot_mat @ np.diag(model.body_inertia[self.mover_body_id]) @ rot_mat.T).copy()
+
+    def _init_damping(self) -> None:
+        """Initialize the damping matrix (damping ratio = 1) based on the current stiffness matrix. If the rotational damping is
+        computed from the inertia of the mover, the rotational damping is constant and therefore only computed here, i.e. this method
+        must be called again if the rotational stiffness is changed.
+        """
+        self.damping = np.zeros((6, 6))
+        self._update_damping()
+        if self.rotational_damping_from_inertia:
+            self.damping[-3:, -3:] = 2 * np.sqrt(self.stiffness[-3:, -3:] * np.diag(self.mover_inertia))
+
+    def _update_damping(self, additional_mass: float = 0.0) -> None:
+        """Update the mass-dependent part of the damping matrix (damping ratio = 1) based on the current stiffness matrix.
+
+        :param additional_mass: any additional mass (float), e.g. the mass of an object the mover is transporting, defaults to 0.0
+        """
+        mass = self.mover_mass + additional_mass
+        if self.rotational_damping_from_inertia:
+            # only the translational damping depends on the (additional) mass
+            self.damping[:3, :3] = 2 * np.sqrt(self.stiffness[:3, :3] * mass)
+        else:
+            self.damping = 2 * np.sqrt(self.stiffness * mass)
 
     def set_joint_mask(self, new_joint_mask: np.ndarray):
         """Set a new joint mask to control only specified DoFs of a mover with this controller.
@@ -136,7 +179,8 @@ class MoverImpedanceController:
         self.mover_dofadr = model.body(self.mover_body_id).dofadr[0]
         self.mover_dofnum = model.body(self.mover_body_id).dofnum[0]
         self.mover_mass = model.body(self.mover_body_id).subtreemass[0]
-        self.damping = 2 * np.sqrt(self.stiffness * self.mover_mass)
+        self.mover_inertia = self._get_mover_inertia(model)
+        self._init_damping()
         # actuators
         self.actuator_ids = np.zeros((len(self.actuator_names),), dtype=np.int32)
         for idx_a, actuator_name in enumerate(self.actuator_names):
@@ -167,7 +211,7 @@ class MoverImpedanceController:
         quat_d = quat_d.astype(np.float64)
 
         # update damping if required
-        self.damping = 2 * np.sqrt(self.stiffness * (self.mover_mass + additional_mass))
+        self._update_damping(additional_mass=additional_mass)
 
         # desired rot mat
         xmat_d = np.zeros((9,))

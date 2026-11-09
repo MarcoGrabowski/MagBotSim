@@ -128,9 +128,13 @@ class GripperMagBotsAPM4330:
         calib_data = MjData(model)
         gravity = model.opt.gravity.copy()
         model.opt.gravity[:] = 0.0
+        # disable all welds (e.g. between movers and rail mounts), since the welded bodies are not necessarily aligned in the initial
+        # configuration (e.g. movers away from the MagBot), which would make the simulation unstable
+        weld_ids = np.where(model.eq_type == mujoco.mjtEq.mjEQ_WELD)[0]
         try:
             for idx_sample, finger_angle in enumerate(finger_angles):
                 mujoco.mj_resetData(model, calib_data)
+                calib_data.eq_active[weld_ids] = 0
                 calib_data.ctrl[finger_actuator_id] = finger_angle
                 for _ in range(0, settle_steps):
                     mujoco.mj_step(model, calib_data)
@@ -181,6 +185,7 @@ class GripperMagBotsAPM4330:
         ``finger_distance_to_angle``.
 
         The finger angle is clipped to the calibrated finger angle range.
+
 
         :param finger_angle: the finger (jaw) angle(s) in rad. Shape: (num_samples,)
         :return: the corresponding distance(s) between the finger pads in m. Shape: (num_samples,)
@@ -321,14 +326,21 @@ class GripperMagBotsAPM4330:
         integral_term = np.clip(self.Ki * self.error_integrated, -1.0, 1.0)
         data.ctrl[self.mover_actuator_ids] = self.Kp * yaw_error + integral_term - self.Kd * current_mover_qvels[:, 5]
 
-    def generate_magbot_xml_strings(self, initial_pos_xyz_mover_c0: np.ndarray, custom_model_xml_strings: dict | None) -> dict:
+    def generate_magbot_xml_strings(
+        self, initial_pos_xyz_mover_c0: np.ndarray, custom_model_xml_strings: dict | None, initial_yaw: np.ndarray | None = None
+    ) -> dict:
         """Generate the MuJoCo XML strings for all Gripper MagBots and add them to the ``custom_model_xml_strings``-dict.
 
         :param initial_pos_xyz_mover_c0: the initial x,y,z-positions for all movers attached to connection 0. Shape: (num_magbots,3)
         :param custom_model_xml_strings: the current ``custom_model_xml_strings``-dict which is modified by this method
+        :param initial_yaw: the initial rotation of the MagBots about the z-axis at connection 0 [rad], defaults to None (no rotation).
+            Shape: (num_magbots,)
         :return: the modified ``custom_model_xml_strings``-dict
         """
         assert initial_pos_xyz_mover_c0.shape == (self.num_magbots, 3)
+        if initial_yaw is None:
+            initial_yaw = np.zeros(self.num_magbots)
+        assert initial_yaw.shape == (self.num_magbots,)
 
         if custom_model_xml_strings is None:
             custom_model_xml_strings = {}
@@ -484,7 +496,8 @@ class GripperMagBotsAPM4330:
             gripper_magbot_list = [
                 f'\n\t\t<!-- Gripper MagBot {idx_magbot} -->',
                 f'\t\t<body name="gripper_magbot_{idx_magbot}" pos="{initial_pos_xyz_mover_c0[idx_magbot, 0]} '
-                f'{initial_pos_xyz_mover_c0[idx_magbot, 1]} {initial_pos_xyz_mover_c0[idx_magbot, 2] + 0.012}" gravcomp="1">',
+                f'{initial_pos_xyz_mover_c0[idx_magbot, 1]} {initial_pos_xyz_mover_c0[idx_magbot, 2] + 0.012}" '
+                f'euler="0 0 {initial_yaw[idx_magbot]:.7f}" gravcomp="1">',
                 '\t\t\t<inertial mass="0.001" diaginertia="1e-6 1e-6 1e-6" pos="0 0 0"/>',
                 f'\t\t\t<joint name="gripper_x_{idx_magbot}" type="slide" axis="1 0 0"/>',
                 f'\t\t\t<joint name="gripper_y_{idx_magbot}" type="slide" axis="0 1 0"/>',
@@ -960,9 +973,12 @@ class GripperMagBotsAPM4330:
             # equality constraints
             gripper_equality_list = [
                 '\n\t<equality>',
-                f'\t\t<weld site1="m_{self.indices_mover_c0[idx_magbot]}_rail_site" site2="rail_mount_0_site_{idx_magbot}"/>',
-                f'\t\t<weld site1="m_{self.indices_mover_c1[idx_magbot]}_rail_site" site2="rail_mount_1_site_{idx_magbot}"/>',
-                f'\t\t<weld site1="m_{self.indices_mover_c2[idx_magbot]}_rail_site" site2="rail_mount_2_site_{idx_magbot}"/>',
+                f'\t\t<weld name="mover_weld_c0_{idx_magbot}" site1="m_{self.indices_mover_c0[idx_magbot]}_rail_site" '
+                f'site2="rail_mount_0_site_{idx_magbot}"/>',
+                f'\t\t<weld name="mover_weld_c1_{idx_magbot}" site1="m_{self.indices_mover_c1[idx_magbot]}_rail_site" '
+                f'site2="rail_mount_1_site_{idx_magbot}"/>',
+                f'\t\t<weld name="mover_weld_c2_{idx_magbot}" site1="m_{self.indices_mover_c2[idx_magbot]}_rail_site" '
+                f'site2="rail_mount_2_site_{idx_magbot}"/>',
                 f'\t\t<joint joint1="k0_connection_joint_{idx_magbot}" joint2="k1_connection_joint_{idx_magbot}"/>',
                 f'\t\t<joint joint1="k0_connection_joint_{idx_magbot}" joint2="k0_toothed_belt_joint_{idx_magbot}"/>',
                 f'\t\t<joint joint1="k1_connection_joint_{idx_magbot}" joint2="k1_toothed_belt_joint_{idx_magbot}"/>',

@@ -5,6 +5,7 @@ from gymnasium.envs.registration import register
 from magbotsim.basic_magbot_env import BasicMagBotEnv
 from magbotsim.magbots.sixD_platform import SixDPlatformMagBotsAPM4330
 from magbotsim.magbots.gripper import GripperMagBotsAPM4330, GripperMagBotsAPM4330Params
+from magbotsim.stations.gripper_station import GripperStation
 from magbotsim.rl_envs.basic_multi_agent_env import BasicMagBotMultiAgentEnv
 from magbotsim.rl_envs.basic_single_agent_env import BasicMagBotSingleAgentEnv
 from magbotsim.utils.benchmark_utils import BENCHMARK_PLANNING_LAYOUTS
@@ -17,6 +18,7 @@ __all__ = [
     'BasicMagBotSingleAgentEnv',
     'GripperMagBotsAPM4330',
     'GripperMagBotsAPM4330Params',
+    'GripperStation',
     'Matplotlib2DViewer',
     'MoverImpedanceController',
     'MujocoViewerCollection',
