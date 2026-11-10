@@ -84,6 +84,10 @@ class GripperMagBotsAPM4330:
         self._finger_distance_grid = None
         self._finger_angle_grid = None
         self._finger_distance_to_angle_spline: CubicSpline | None = None
+        # same calibration, ordered by ascending angle (used by finger_angle_to_distance)
+        self._finger_angle_grid_by_angle = None
+        self._finger_distance_grid_by_angle = None
+        self._finger_angle_to_distance_spline: CubicSpline | None = None
         self.finger_distance_min = None
         self.finger_distance_max = None
 
@@ -147,7 +151,19 @@ class GripperMagBotsAPM4330:
         finally:
             model.opt.gravity[:] = gravity
 
-        # store the samples ordered by ascending distance (required by CubicSpline)
+        self._set_finger_calibration(finger_distances=finger_distances, finger_angles=finger_angles)
+
+    def _set_finger_calibration(self, finger_distances: np.ndarray, finger_angles: np.ndarray) -> None:
+        """Store the calibration samples of the mapping between the finger distance and the finger (jaw) angle and build one C2-continuous
+        cubic spline per direction (distance -> angle and angle -> distance) through these samples, so that both directions are equally
+        fast. Since the two splines are independent, they are only exact inverses of each other at the calibration samples; in between,
+        the round trip error is in the order of 1e-5 m for 25 calibration samples. The samples are sorted once here (CubicSpline
+        requires strictly ascending sample points).
+
+        :param finger_distances: the distances between the finger pads in m. Shape: (num_calib_samples,)
+        :param finger_angles: the corresponding finger (jaw) angles in rad. Shape: (num_calib_samples,)
+        """
+        # ordered by ascending distance (finger_distance_to_angle)
         order = np.argsort(finger_distances)
         self._finger_distance_grid = finger_distances[order]
         self._finger_angle_grid = finger_angles[order]
@@ -158,6 +174,7 @@ class GripperMagBotsAPM4330:
         order = np.argsort(finger_angles)
         self._finger_angle_grid_by_angle = finger_angles[order]
         self._finger_distance_grid_by_angle = finger_distances[order]
+        self._finger_angle_to_distance_spline = CubicSpline(self._finger_angle_grid_by_angle, self._finger_distance_grid_by_angle)
 
     def finger_distance_to_angle(self, finger_distance: np.ndarray) -> np.ndarray:
         """Convert a desired distance between the two finger pads to the corresponding finger (jaw) angle.
@@ -175,6 +192,27 @@ class GripperMagBotsAPM4330:
 
         clipped_distance = np.clip(finger_distance, self._finger_distance_grid[0], self._finger_distance_grid[-1])
         return self._finger_distance_to_angle_spline(clipped_distance)
+
+    def finger_angle_to_distance(self, finger_angle: np.ndarray) -> np.ndarray:
+        """Convert a finger (jaw) angle to the corresponding distance between the two finger pads, i.e. the inverse of
+        ``finger_distance_to_angle``.
+
+        The finger angle is clipped to the calibrated finger angle range. The distance is evaluated with a separate cubic spline
+        (angle -> distance) through the same calibration samples, i.e. this method is only an exact inverse of
+        ``finger_distance_to_angle`` at the calibration samples (see ``_set_finger_calibration``).
+
+        :param finger_angle: the finger (jaw) angle(s) in rad. Shape: (num_samples,)
+        :return: the corresponding distance(s) between the finger pads in m. Shape: (num_samples,)
+        """
+        angle_grid = self._finger_angle_grid_by_angle
+        if angle_grid is None or self._finger_angle_to_distance_spline is None:
+            raise RuntimeError(
+                'Finger distance calibration is not available. Call update_cached_mujoco_data(model) before using '
+                'finger_angle_to_distance or moverSetPose2GripperSetPose.'
+            )
+
+        clipped_angle = np.clip(finger_angle, angle_grid[0], angle_grid[-1])
+        return self._finger_angle_to_distance_spline(clipped_angle)
 
     def _update_cached_gripper_qpos_indices(self, model: MjModel) -> None:
         """Update gripper qpos indices.

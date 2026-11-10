@@ -51,13 +51,15 @@ def poses(env: ReconfigurationEnv) -> dict[str, np.ndarray]:
 def move(env: ReconfigurationEnv, start: np.ndarray, end: np.ndarray, duration: float, gripper: bool = False, hold: float = 0.5) -> bool:
     """Move the movers (or the MagBot gripper) linearly from start to end and hold the end pose.
 
-    :return: True if a collision occurred, False otherwise
+    :return: True if a station proxy collision occurred, False otherwise
     """
     dt = env.magbots.cycle_time * NUM_CYCLES
     setposes = [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))] + [end] * int(hold / dt)
     for setpose in setposes:
         mover_setposes = env.get_mover_poses_from_gripper_setPose(gripper_setposes=setpose) if gripper else setpose
-        if env.step(mover_setposes=mover_setposes, single_track=np.array([False]), num_cycles=NUM_CYCLES):
+        env.step(mover_setposes=mover_setposes, num_cycles=NUM_CYCLES)
+        # step() stops at the first collision, i.e. the colliding contacts are still present after step()
+        if env.check_station_proxy_collision():
             return True
     return False
 

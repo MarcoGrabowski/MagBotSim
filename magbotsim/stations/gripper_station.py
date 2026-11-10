@@ -1,6 +1,22 @@
 import numpy as np
 
+from magbotsim.magbots.gripper import GripperMagBotsAPM4330Params
 from magbotsim.stations.station_collision_proxies import StationCollisionProxies
+
+
+def _magbot_m2_offset(m0m1_dist: float, magbot_params: GripperMagBotsAPM4330Params) -> float:
+    """Calculate the distance between the mover attached to connection 2 and the line through the movers attached to connection 0 and 1
+    for a given distance between the movers attached to connection 0 and 1, i.e. the m2 offset that results from the kinematics of the
+    Gripper MagBot (platform height as in ``moverSetPose2GripperSetPose``, mover 2 distance as in ``gripperSetPose2MoverSetPose`` without
+    single-track mode).
+
+    :param m0m1_dist: the distance between the movers attached to connection 0 and 1 [m]
+    :param magbot_params: the parameters of the Gripper MagBot
+    :return: the distance between the mover attached to connection 2 and the line through the movers attached to connection 0 and 1 [m]
+    """
+    p = magbot_params
+    z_p = p.z_b01 + p.z_t01 + np.sqrt(p.k_01**2 - (0.5 * m0m1_dist - p.x_b01 - p.x_t01) ** 2)
+    return float(p.x_t2 + p.x_b2 + np.sqrt(p.k_2**2 - (z_p - p.z_t2 - p.z_b2) ** 2))
 
 
 class GripperStation:
@@ -22,7 +38,9 @@ class GripperStation:
     """
 
     MAGBOT_M0M1_DIST = 0.48         # [m] distance between mover 0 and mover 1
-    MAGBOT_M2_OFFSET = 0.12         # [m] distance between mover 2 and the line through mover 0 and mover 1
+    # [m] distance between mover 2 and the line through mover 0 and mover 1 (approx. 0.12 m); derived from the kinematics of the default
+    # Gripper MagBot, so that the mover poses in the station are exactly reachable (see get_mover_poses)
+    MAGBOT_M2_OFFSET = _magbot_m2_offset(MAGBOT_M0M1_DIST, GripperMagBotsAPM4330Params())
     MOVER_C0C1_REL_X_POS = 0.0851   # [m] x-pos of the movers attached to connection 0 and 1 relative to the m2 mount (station body frame)
 
     # mover positions at which the MagBot is located in the station relative to the m2 mount (station body frame)
