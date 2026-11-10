@@ -1,5 +1,7 @@
 import numpy as np
 
+from magbotsim.stations.station_collision_proxies import StationCollisionProxies
+
 
 class GripperStation:
     """A station in which a Gripper MagBot can be parked, i.e. the movers can leave the MagBot in the station and pick it up again.
@@ -10,6 +12,9 @@ class GripperStation:
     The movers enter and leave the station along the y-axis of the station body frame (rail mounts welded to the station). The
     MagBot is taken out of the station and moved back into it along the x-axis of the station body frame (rail mounts welded to the
     movers).
+
+    The station meshes are visual-only. If a ``StationCollisionProxies`` instance is specified in ``generate_body_xml_str()``, the
+    station gets hidden pins as collision proxies, which hold the parked rail mounts (see ``StationCollisionProxies``).
 
     :param pos: the (x, y, z) position of the m2 mount in the world frame [m]
     :param yaw: the rotation of the whole station about the world z-axis [rad], defaults to 0.0
@@ -30,11 +35,14 @@ class GripperStation:
     )  # [m]
     MOVER_REL_YAW = np.pi / 2  # [rad]
 
-    STATION_M0M1_Y_POS = 0.24452294             # [m] y-pos of the m0/m1 station meshes relative to the m2 mount (station body frame, before the mesh origin correction)
+    STATION_M0M1_Y_POS = 0.5 * MAGBOT_M0M1_DIST  # [m] y-pos of the m0/m1 station meshes relative to the m2 mount (station body frame, before the mesh origin correction)
     STATION_M2_MOVER_C2_X_DIST = 0.22401599     # [m] x-distance between the m2 station mesh and the mover c2 at which rail mount 2 is fully seated in the m2 station
 
     STATION_M0M1_X_OFFSET = 0.05665             # [m] offset of the m0/m1 station mesh in its x-direction (mesh frame)
     STATION_M2_CORRECTION = 0.025               # [m] correction of the m2 station and m2 mount meshes in their y-direction (mesh frame)
+    # z-pos of the station meshes relative to the m2 mount, such that the station pins are centered in the holes of the rail mounts
+    STATION_M0M1_Z_POS = 0.00515                # [m]
+    STATION_M2_Z_POS = 0.00185                  # [m]
 
     def __init__(self, pos: np.ndarray, yaw: float = 0.0, name: str = 'station') -> None:
         assert pos.shape == (3,)
@@ -88,17 +96,21 @@ class GripperStation:
         ]
         return '\n'.join(assets_list)
 
-    def generate_body_xml_str(self) -> str:
+    def generate_body_xml_str(self, proxies: StationCollisionProxies | None = None, rail_mount_z: float | None = None) -> str:
         """Generate the XML string for the station body.
 
+        :param proxies: the hidden collision proxies for the station switch, defaults to None. If specified, the station pins are
+            added to the station body. If None, the station does not collide with anything.
+        :param rail_mount_z: the z-pos of the rail mount origin of a parked MagBot in the world frame [m], i.e. the z-pos of the mover
+            adapter (mover z-pos + mover half height + 0.006 m for the Gripper MagBot). Required if ``proxies`` is specified.
         :return: the XML string of the body containing the station
         """
         # positions of the m0 and m1 station relative to the m2 station (station body frame)
         # the m0/m1 station meshes are rotated by -90 deg, i.e. the mesh x-direction corresponds to the -y-direction of the station body
-        rel_pos_m0 = np.array([0.0, self.STATION_M0M1_Y_POS + self.STATION_M0M1_X_OFFSET, 0.0045])  # [m]
-        rel_pos_m1 = np.array([0.0, -self.STATION_M0M1_Y_POS + self.STATION_M0M1_X_OFFSET, 0.0045])  # [m]
+        rel_pos_m0 = np.array([0.0, self.STATION_M0M1_Y_POS + self.STATION_M0M1_X_OFFSET, self.STATION_M0M1_Z_POS])  # [m]
+        rel_pos_m1 = np.array([0.0, -self.STATION_M0M1_Y_POS + self.STATION_M0M1_X_OFFSET, self.STATION_M0M1_Z_POS])  # [m]
         rel_pos_m2 = np.array(
-            [self.MOVER_REL_XY_POS[2, 0] - self.STATION_M2_MOVER_C2_X_DIST, self.STATION_M2_CORRECTION, 0.0]
+            [self.MOVER_REL_XY_POS[2, 0] - self.STATION_M2_MOVER_C2_X_DIST, self.STATION_M2_CORRECTION, self.STATION_M2_Z_POS]
         )  # [m]
         rel_pos_mount_m2 = np.array([0.0, self.STATION_M2_CORRECTION, 0.0])  # [m]
 
@@ -120,8 +132,15 @@ class GripperStation:
             f'\t\t\t<geom name="{n}_m1_geom" type="mesh" mesh="station_m0m1_mesh" mass="0.001" '
             f'pos="{rel_pos_m1[0]:.5f} {rel_pos_m1[1]:.5f} {rel_pos_m1[2]:.5f}" euler="0 0 -1.5707963" material="black" '
             'contype="0" conaffinity="0"/>',
-            '\t\t</body>',
         ]
+        if proxies is not None:
+            assert rail_mount_z is not None, 'rail_mount_z is required if station collision proxies are specified'
+            lines.append(
+                proxies.station_pins_xml_str(
+                    body_name=f'{n}_pins', rail_mount_xy_pos=self.MOVER_REL_XY_POS, rail_mount_z=rail_mount_z - self.pos[2]
+                )
+            )
+        lines.append('\t\t</body>')
         return '\n'.join(lines)
 
     def generate_equality_xml_str(self, idx_magbot: int) -> str:

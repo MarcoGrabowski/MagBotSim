@@ -4,6 +4,7 @@ import mujoco
 from mujoco import MjModel, MjData
 from magbotsim.utils import rotations_utils, mujoco_utils
 from magbotsim.utils.rotations_utils import ContinuousYawExtractor
+from magbotsim.stations.station_collision_proxies import StationCollisionProxies
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,9 @@ class GripperMagBotsAPM4330:
     :param indices_mover_c2: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 2
     :param magbot_params: an instance of GripperMagBotsAPM4330Params
     :param cycle_time: the cycle time used in the BasicMagBotEnv (usually 1ms)
+    :param station_proxies: the hidden collision proxies for the station switch, defaults to None. If specified, the rail mount
+        meshes are visual-only and each rail mount gets a collision proxy (see ``StationCollisionProxies``), which is required to park the
+        MagBot in stations. If None, the rail mount meshes collide as usual.
     """
 
     def __init__(
@@ -51,8 +55,10 @@ class GripperMagBotsAPM4330:
         indices_mover_c2: np.ndarray,
         magbot_params: GripperMagBotsAPM4330Params,
         cycle_time: float,
+        station_proxies: StationCollisionProxies | None = None,
     ) -> None:
         self.num_magbots = num_magbots
+        self.station_proxies = station_proxies
         self.magbots = []
         self.magbot_params = magbot_params
 
@@ -345,6 +351,25 @@ class GripperMagBotsAPM4330:
         if custom_model_xml_strings is None:
             custom_model_xml_strings = {}
 
+        # rail mount and mover adapter meshes are visual-only if the station collision proxies are used
+        rail_mount_contact_attr = ' contype="0" conaffinity="0"' if self.station_proxies is not None else ''
+        adapter_contact_attr = rail_mount_contact_attr
+
+        def rail_rod(idx_mover: int) -> str:
+            """Return the XML string of the rail rod of a mover adapter (empty if no station collision proxies are used)."""
+            if self.station_proxies is None:
+                return ''
+            return '\n' + self.station_proxies.rail_rod_xml_str(body_name=f'm_{idx_mover}_rail_rod')
+
+        def rail_mount_proxy(idx_c: int, idx_magbot: int) -> str:
+            """Return the XML string of the rail mount collision proxy (empty if no station collision proxies are used)."""
+            if self.station_proxies is None:
+                return ''
+            # the footprint of rail mount 2 is mirrored in x-direction (rail_mount_m1m2.stl rotated by +90 deg instead of -90 deg)
+            return '\n' + self.station_proxies.rail_mount_proxy_xml_str(
+                body_name=f'rail_mount_{idx_c}_{idx_magbot}_proxy', mirror_x=idx_c == 2
+            )
+
         for idx_magbot in range(0, self.num_magbots):
             if idx_magbot == 0:
                 # option
@@ -424,6 +449,8 @@ class GripperMagBotsAPM4330:
                     '\t\t<mesh name="shaft_3x45mm" file="magbots/gripper_XPlanar_APM4330/gripper/shaft_3x45mm.stl" scale="1 1 1" />',
                     '\t\t<mesh name="flanged_pulley" file="magbots/gripper_XPlanar_APM4330/gripper/flanged_pulley.stl" scale="1 1 1" />',
                 ]
+                if self.station_proxies is not None:
+                    gripper_assets_list.append(self.station_proxies.assets_xml_str())
                 gripper_assets_xml_str = '\n'.join(gripper_assets_list)
                 custom_assets_xml_str = custom_model_xml_strings.get('custom_assets_xml_str', None)
                 if custom_assets_xml_str is not None:
@@ -440,15 +467,16 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t<site name="site_m_{self.indices_mover_c0[idx_magbot]}" pos="0 0 0"/>',
                 f'\n\t\t\t<body name="m_{self.indices_mover_c0[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 -1.5708">',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                'pos="0 0 0" material="black"/>',
+                f'pos="0 0 0" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<site name="m_{self.indices_mover_c0[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 1.5708" size="0.001" '
                 'type="sphere"/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" '
-                'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"/>',
+                f'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" '
-                'euler="0 0 1.5708" mesh="spring_loaded_pin" material="black"/>',
+                f'euler="0 0 1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" '
-                'material="black"/>',
+                f'material="black"{adapter_contact_attr}/>'
+                + rail_rod(self.indices_mover_c0[idx_magbot]),
                 '\t\t\t</body>',
             ]
             mover_body_c0_xml_str = '\n'.join(mover_body_c0_list)
@@ -458,15 +486,16 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t<site name="site_m_{self.indices_mover_c1[idx_magbot]}" pos="0 0 0"/>',
                 f'\n\t\t\t<body name="m_{self.indices_mover_c1[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 1.5708">',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                'pos="0 0 0" material="black"/>',
+                f'pos="0 0 0" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<site name="m_{self.indices_mover_c1[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 1.5708" size="0.001" '
                 'type="sphere"/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" '
-                'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"/>',
+                f'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" euler="0 0 1.5708"'
-                ' mesh="spring_loaded_pin" material="black"/>',
+                f' mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" '
-                'material="black"/>',
+                f'material="black"{adapter_contact_attr}/>'
+                + rail_rod(self.indices_mover_c1[idx_magbot]),
                 '\t\t\t</body>',
             ]
             mover_body_c1_xml_str = '\n'.join(mover_body_c1_list)
@@ -477,15 +506,16 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t<site name="site_m_{self.indices_mover_c2[idx_magbot]}" pos="0 0 0"/>',
                 f'\n\t\t\t<body name="m_{self.indices_mover_c2[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 1.5708">',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                'pos="0 0 0" material="black"/>',
+                f'pos="0 0 0" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<site name="m_{self.indices_mover_c2[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 -1.5708" size="0.001" '
                 'type="sphere"/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" '
-                'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"/>',
+                f'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" euler="0 0 1.5708"'
-                ' mesh="spring_loaded_pin" material="black"/>',
+                f' mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" '
-                'material="black"/>',
+                f'material="black"{adapter_contact_attr}/>'
+                + rail_rod(self.indices_mover_c2[idx_magbot]),
                 '\t\t\t</body>',
             ]
             mover_body_c2_xml_str = '\n'.join(mover_body_c2_list)
@@ -507,8 +537,9 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t\t<joint name="rail_mount_0_joint_{idx_magbot}" type="slide" axis="1 0 0" damping="0.1"/>',
                 f'\t\t\t\t<joint name="rail_mount_0_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_0_{idx_magbot}" type="mesh" mesh="rail_mount_m0_mesh" mass="0.5" pos="0 0 0" '
-                'material="black"/>',
-                f'\t\t\t\t<site name="rail_mount_0_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>',
+                f'material="black"{rail_mount_contact_attr}/>',
+                f'\t\t\t\t<site name="rail_mount_0_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
+                + rail_mount_proxy(0, idx_magbot),
                 f'\t\t\t\t<body name="rotation_plate_m0_{idx_magbot}" pos="0 0 0.0285" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_m0_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0"/>',
                 f'\t\t\t\t\t<geom name="rotation_plate_m0_geom_{idx_magbot}" type="mesh" pos="0 0 0" mass="0.01" mesh="rotation_plate_m0" '
@@ -844,8 +875,9 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t\t<joint name="rail_mount_1_joint_{idx_magbot}" type="slide" axis="1 0 0" damping="0.1"/>',
                 f'\t\t\t\t<joint name="rail_mount_1_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_1_{idx_magbot}" type="mesh" euler="0 0 -1.5707963" mesh="rail_mount_m1m2_mesh" '
-                'mass="0.5" pos="0 0 0" material="black"/>',
-                f'\t\t\t\t<site name="rail_mount_1_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>',
+                f'mass="0.5" pos="0 0 0" material="black"{rail_mount_contact_attr}/>',
+                f'\t\t\t\t<site name="rail_mount_1_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
+                + rail_mount_proxy(1, idx_magbot),
                 f'\t\t\t\t<body name="rotation_plate_m1_{idx_magbot}" pos="0 0 0.0285" euler="0 0 3.14159" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_m1_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0"/>',
                 f'\t\t\t\t\t<geom name="rotation_plate_m1_geom_{idx_magbot}" type="mesh" pos="0 0 0" mass="0.01" mesh="rotation_plate_m1" '
@@ -890,8 +922,9 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t\t<joint name="rail_mount_2_joint_{idx_magbot}" type="slide" axis="0 1 0" damping="0.1"/>',
                 f'\t\t\t\t<joint name="rail_mount_2_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_2_{idx_magbot}" type="mesh" mesh="rail_mount_m1m2_mesh" euler="0 0 1.5707963" '
-                'mass="0.5" pos="0 0 0" material="black"/>',
-                f'\t\t\t\t<site name="rail_mount_2_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>',
+                f'mass="0.5" pos="0 0 0" material="black"{rail_mount_contact_attr}/>',
+                f'\t\t\t\t<site name="rail_mount_2_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
+                + rail_mount_proxy(2, idx_magbot),
                 f'\t\t\t\t<body name="rotation_plate_m2_{idx_magbot}" pos="0 0 0.0285" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_m2_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0"/>',
                 f'\t\t\t\t\t<geom name="rotation_plate_m2_geom_{idx_magbot}" type="mesh" pos="0 0 0" mass="0.01" mesh="rotation_plate_m2" '
@@ -962,6 +995,12 @@ class GripperMagBotsAPM4330:
                 f'\t\t<exclude body1="k1_toothed_belt_{idx_magbot}" body2="platform_{idx_magbot}"/>',
                 f'\t\t<exclude body1="k2_toothed_belt_{idx_magbot}" body2="platform_{idx_magbot}"/>',
             ]
+            if self.station_proxies is not None:
+                # the rail mount proxies touch the rotation plates (top of the proxy = bottom of the rotation plate)
+                gripper_contact_list += [
+                    f'\t\t<exclude body1="rail_mount_{idx_c}_{idx_magbot}_proxy" body2="rotation_plate_m{idx_c}_{idx_magbot}"/>'
+                    for idx_c in range(0, 3)
+                ]
             gripper_contact_xml_str = '\n'.join(gripper_contact_list)
             custom_contact_xml_str = custom_model_xml_strings.get('custom_contact_xml_str', None)
             if custom_contact_xml_str is not None:
