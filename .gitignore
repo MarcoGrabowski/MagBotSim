@@ -208,5 +208,5 @@ __marimo__/
 
 docs/stl_list.rst
 
-# Mac specific files
+# MacOS specific files
 .DS_Store

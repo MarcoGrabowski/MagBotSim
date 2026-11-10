@@ -1,14 +1,20 @@
 Changelog
 =========
 
-Upcoming Release
-----------------
+Pre-Release v1.4.0a2 (2026-11-10)
+---------------------------------
 
 General
 ^^^^^^^
-1. Add forward kinematics for the Gripper MagBot (``moverSetPose2GripperSetPose``) and the 6D-Platform MagBot
-   (``moverSetPose2PlatformSetPose``)
-2. Add ``finger_angle_to_distance`` (Gripper MagBot) and ``moverDist2PlatformZPos`` (6D-Platform MagBot)
+1. Added optional, collision-enabled profile frames around exposed tile edges,
+   including inner holes, through ``use_profile_frame``. The profile and cover tops are 0.065 m (6.5 cm) above the tile surface.
+
+Bug Fixes
+^^^^^^^^^
+1. Fixed initialization of ``BasicMagBotMultiAgentEnv``.
+2. Fixed some minor discontinuity issues in edge cases:
+    - Numerical rounding issue for z_p_min (in ``GripperMagBotsAPM4330Params``)
+    - Finger distance to angle calculation now became c2 smooth (in ``GripperMagBotsAPM4330``)
 
 Release v1.3.0 (2026-09-11)
 ---------------------------
