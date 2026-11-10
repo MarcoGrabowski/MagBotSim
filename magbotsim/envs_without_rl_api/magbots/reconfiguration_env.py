@@ -111,6 +111,7 @@ class ReconfigurationEnv(BasicMagBotEnv):
             custom_model_xml_strings=None,
             render_mode=render_mode,
             use_mj_passive_viewer=True,
+            use_profile_frame=True,
         )
 
         # impedance controller
@@ -130,59 +131,6 @@ class ReconfigurationEnv(BasicMagBotEnv):
 
         # reload model to add MagBots and actuators
         self.reload_model(mover_start_xy_pos=self.initial_mover_xy_pos)
-
-    def _generate_extrusion_xml_str(self) -> str:
-        """Generate the XML string for the aluminum extrusions surrounding the tiles. The extrusions are mounted directly at the tiles
-        and arranged as a pinwheel, i.e. each side starts at the inner face of the previous side and fills the next corner
-        (counterclockwise). Each side consists of (n-1) 240 mm extrusions and one 290 mm extrusion at the corner,
-        where n is the number of tiles along that side. The open ends at the corners are closed by covers.
-
-        :return: the XML string of the body containing the extrusions and covers
-        """
-        lengths = {240: 0.24, 290: 0.29}  # [m]
-        profile_width = 0.05  # [m]
-        profile_height = 0.1  # [m]
-        z_bottom = -0.04  # [m]
-
-        # outer edges of the tiles (= inner faces of the extrusions)
-        active_x_pos = self.x_pos_tiles[self.layout_tiles == 1]
-        active_y_pos = self.y_pos_tiles[self.layout_tiles == 1]
-        x_min, x_max = np.min(active_x_pos) - self.tile_size[0], np.max(active_x_pos) + self.tile_size[0]
-        y_min, y_max = np.min(active_y_pos) - self.tile_size[1], np.max(active_y_pos) + self.tile_size[1]
-        num_tiles_x = int(np.round((x_max - x_min) / (2 * self.tile_size[0])))
-        num_tiles_y = int(np.round((y_max - y_min) / (2 * self.tile_size[1])))
-
-        # (start point at the inner face, direction, number of tiles) for each side (counterclockwise)
-        sides = [
-            (np.array([x_min, y_min]), np.array([1.0, 0.0]), num_tiles_x),  # bottom
-            (np.array([x_max, y_min]), np.array([0.0, 1.0]), num_tiles_y),  # right
-            (np.array([x_max, y_max]), np.array([-1.0, 0.0]), num_tiles_x),  # top
-            (np.array([x_min, y_max]), np.array([0.0, -1.0]), num_tiles_y),  # left
-        ]
-
-        lines = ['\n\t\t<!-- aluminum extrusions and covers -->', '\t\t<body name="aluminum_extrusions" pos="0 0 0" gravcomp="1">']
-        for idx_side, (start, direction, num_tiles) in enumerate(sides):
-            outward = np.array([direction[1], -direction[0]])
-            # extrusion mesh frame: x-axis = profile width (centered), y-axis = profile height (centered), z-axis = extrusion direction
-            xyaxes_extrusion = f'{outward[0]:.0f} {outward[1]:.0f} 0 0 0 1'
-            s = 0.0
-            for idx_extrusion, length in enumerate([240] * (num_tiles - 1) + [290]):
-                pos = start + (s + lengths[length]) * direction + 0.5 * profile_width * outward
-                lines.append(
-                    f'\t\t\t<geom name="alu_extrusion_{idx_side}_{idx_extrusion}" type="mesh" mesh="alu_extrusion_{length}_mesh" '
-                    f'mass="0.2" pos="{pos[0]:.5f} {pos[1]:.5f} {z_bottom + 0.5 * profile_height:.5f}" '
-                    f'xyaxes="{xyaxes_extrusion}" material="gray"/>'
-                )
-                s += lengths[length]
-            # cover at the open end (cover mesh frame: x-axis = profile width, y-axis = thickness, z-axis = profile height)
-            pos = start + s * direction
-            lines.append(
-                f'\t\t\t<geom name="cover_geom_{idx_side}" type="mesh" mesh="cover_mesh" mass="0.1" '
-                f'pos="{pos[0]:.5f} {pos[1]:.5f} {z_bottom:.5f}" '
-                f'xyaxes="{outward[0]:.0f} {outward[1]:.0f} 0 {direction[0]:.0f} {direction[1]:.0f} 0" material="black"/>'
-            )
-        lines.append('\t\t</body>')
-        return '\n'.join(lines)
 
     def _custom_xml_string_callback(self, custom_model_xml_strings: dict[str, str] | None = None) -> dict[str, str]:
         """Add the MagBots and actuators for the movers to the MuJoCo model by modifying the ``custom_model_xml_strings``-dict.
@@ -236,13 +184,7 @@ class ReconfigurationEnv(BasicMagBotEnv):
             # assets application
             custom_assets_xml_str = custom_model_xml_strings['custom_assets_xml_str']
             application_assets_list = [
-                # extrusions (STL files in mm, extrusion direction along the z-axis)
                 '\n\t\t<!-- assets reconfiguration benchmark -->',
-                '\t\t<mesh name="alu_extrusion_240_mesh" file="./misc/reconfiguration_benchmark/50x100_240.stl" '
-                'scale="0.001 0.001 0.001"/>',
-                '\t\t<mesh name="alu_extrusion_290_mesh" file="./misc/reconfiguration_benchmark/50x100_290.stl" '
-                'scale="0.001 0.001 0.001"/>',
-                '\t\t<mesh name="cover_mesh" file="./misc/gripper_application_example/cover.stl" scale="1 1 1"/>',
                 # stations
                 GripperStation.generate_assets_xml_str(),
             ]
@@ -250,17 +192,11 @@ class ReconfigurationEnv(BasicMagBotEnv):
             custom_assets_xml_str += application_assets_xml_str
             custom_model_xml_strings['custom_assets_xml_str'] = custom_assets_xml_str
 
-            # center lines of the extrusions at the bottom and right side (supply platforms and product are placed relative to them)
-            y_extrusion_bottom = np.min(self.y_pos_tiles[self.layout_tiles == 1]) - self.tile_size[1] - 0.025
-            x_extrusion_right = np.max(self.x_pos_tiles[self.layout_tiles == 1]) + self.tile_size[0] + 0.025
-
             # z-pos of the rail mount origin of a parked MagBot (= z-pos of the mover adapter: mover z-pos + mover half height + 0.006)
             rail_mount_z = self.initial_mover_z_pos + float(np.max(self.mover_size[:, 2])) + 0.006
 
             custom_worldbody_xml_str = custom_model_xml_strings['custom_worldbody_xml_str']
             application_bodies_list = [
-                # extrusions
-                self._generate_extrusion_xml_str(),
                 # stations
                 *[station.generate_body_xml_str(proxies=self.station_proxies, rail_mount_z=rail_mount_z) for station in self.stations],
             ]
