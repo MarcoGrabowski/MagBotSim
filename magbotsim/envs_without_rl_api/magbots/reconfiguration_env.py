@@ -124,7 +124,6 @@ class ReconfigurationEnv(BasicMagBotEnv):
                 joint_mask=np.array([1, 1, 1, 1, 1, 0]),
                 translational_stiffness=np.array([5000.0, 5000.0, 10.0]),
                 rotational_stiffness=np.array([5.0, 5.0, 0.0]),
-                rotational_damping_from_inertia=True,
             )
             for mover_idx in range(self.num_movers)
         ]
