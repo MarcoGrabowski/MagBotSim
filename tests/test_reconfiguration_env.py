@@ -107,3 +107,117 @@ def test_magbot_diagonal_entry_collides(env: ReconfigurationEnv, poses: dict[str
     assert move(env, poses['gripper_shifted'], poses['gripper_station'], duration=1.5, gripper=True)
     assert env.check_station_proxy_collision()
     assert any('_pins_' in names and '_upper_' in names for names in proxy_contact_names(env))
+
+
+# Tests of the randomization of the reconfiguration env: random collision-free mover start positions and random shift of the MagBot
+# along the x-axis of the station (take-out axis, i.e. along the station pins).
+
+
+def mover_contacts(env: ReconfigurationEnv) -> list[str]:
+    """Return the names of both geoms of each contact between a mover (incl. its attached bodies) and any body that is not a mover."""
+    mover_ids = {mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, name) for name in env.mover_names}
+    root_ids = env.model.body_rootid[env.model.geom_bodyid]
+    return [
+        '|'.join(mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_GEOM, idx_geom) for idx_geom in pair)
+        for pair in env.data.contact.geom[: env.data.ncon]
+        if (root_ids[pair[0]] in mover_ids) != (root_ids[pair[1]] in mover_ids)
+    ]
+
+
+def station_frame_offsets(env: ReconfigurationEnv, rail_mount_xy_ref: np.ndarray) -> np.ndarray:
+    """Return the offsets of the real rail mount positions w.r.t. the reference positions in the station frame [m]."""
+    return (env.get_rail_mount_xy() - rail_mount_xy_ref) @ env.stations[0].rotation_matrix_xy()
+
+
+def pickup_poses(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Mover set poses and gripper set pose at the real (shifted) positions of the parked rail mounts (connection idx_c = mover idx_c)."""
+    rot_station = env.stations[0].rotation_matrix_xy()
+    p = {'station': poses['station'].copy()}
+    p['station'][:, :2] = env.get_rail_mount_xy()
+    p['entrance'] = p['station'].copy()
+    p['entrance'][:, :2] += np.array([[0.0, -0.145], [0.0, 0.145], [0.0, 0.145]]) @ rot_station.T
+    p['pre_station'] = p['entrance'].copy()
+    p['pre_station'][:, :2] += np.array([0.2, 0.0]) @ rot_station.T
+    p['gripper_station'] = env.magbots.moverSetPose2GripperSetPose(mover_poses=p['station'][np.newaxis])
+    return p
+
+
+def test_random_mover_start_positions() -> None:
+    env = ReconfigurationEnv(station_poses=STATION_POSES, randomize_magbot_station_pos=True, seed=1, render_mode=None)
+    for seed in range(50):
+        env.reset_scene(rng=np.random.default_rng(seed))
+        assert env.mover_start_xy_pos.shape == (env.num_movers, 2)
+        assert not env.check_wall_collision(mover_names=env.mover_names, c_size=env.c_size).any()
+        assert not env.check_mover_collision(mover_names=env.mover_names, c_size=env.c_size)
+        assert not env.check_station_proxy_collision()
+        assert not mover_contacts(env)
+    env.close()
+
+    # same seed -> same start positions and MagBot offsets
+    env_1 = ReconfigurationEnv(station_poses=STATION_POSES, randomize_magbot_station_pos=True, seed=3, render_mode=None)
+    env_2 = ReconfigurationEnv(station_poses=STATION_POSES, randomize_magbot_station_pos=True, seed=3, render_mode=None)
+    assert np.allclose(env_1.initial_mover_xy_pos, env_2.initial_mover_xy_pos)
+    assert np.allclose(env_1.magbot_station_x_offsets, env_2.magbot_station_x_offsets)
+    assert np.abs(env_1.magbot_station_x_offsets).max() <= env_1.magbot_station_randomization_x_range
+    env_1.close()
+    env_2.close()
+
+
+def test_explicit_start_positions_are_kept(env: ReconfigurationEnv) -> None:
+    assert np.allclose(env.initial_mover_xy_pos, INITIAL_MOVER_XY_POS)
+    assert np.allclose(env.get_mover_qpos(mover_names=env.mover_names)[:, :2], INITIAL_MOVER_XY_POS)
+    assert np.allclose(env.magbot_station_x_offsets, 0.0)
+
+
+@pytest.mark.parametrize('x_offset', [-0.005, 0.0023, 0.005])
+def test_magbot_station_shift(env: ReconfigurationEnv, poses: dict[str, np.ndarray], x_offset: float) -> None:
+    rail_mount_xy_ref = env.get_rail_mount_xy()  # unshifted MagBot
+    env.reset_scene(mover_start_xy_pos=INITIAL_MOVER_XY_POS, magbot_station_x_offsets=np.array([x_offset]))
+    # all rail mounts are shifted exactly by the offset along the x-axis of the station (no settling required)
+    assert np.allclose(station_frame_offsets(env, rail_mount_xy_ref), [[x_offset, 0.0]] * 3, atol=1e-6)
+    assert not env.check_station_proxy_collision()
+    assert not mover_contacts(env)
+    # the MagBot stays in the shifted pose while the movers are held
+    rail_mount_xy_shifted = env.get_rail_mount_xy()
+    assert not move(env, poses['initial'], poses['initial'], duration=0.0, hold=0.5)
+    assert np.abs(env.get_rail_mount_xy() - rail_mount_xy_shifted).max() < 0.0002
+
+
+def test_shifted_magbot_pickup_and_putback(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> None:
+    env.reset_scene(mover_start_xy_pos=INITIAL_MOVER_XY_POS, magbot_station_x_offsets=np.array([0.004]))
+    pickup = pickup_poses(env, poses)
+    # the empty movers enter the station at the real rail mount positions and take the MagBot out of the station
+    assert not move(env, poses['initial'], pickup['pre_station'], duration=1.5)
+    assert not move(env, pickup['pre_station'], pickup['entrance'], duration=1.5)
+    assert not move(env, pickup['entrance'], pickup['station'], duration=1.5)
+    assert (env.mover_station_indices == 0).all()
+    assert not move(env, pickup['gripper_station'], poses['gripper_center'], duration=1.5, gripper=True)
+    assert (env.mover_station_indices == -1).all()
+    # the rail mounts were picked up without a jump, i.e. they stay on the mover adapters
+    mover_xy = env.get_mover_qpos(mover_names=env.mover_names)[:, :2]
+    assert np.linalg.norm(env.get_rail_mount_xy() - mover_xy, axis=1).max() < 0.0005
+
+    # the MagBot is put back at the nominal station pose and stays there (no re-randomization)
+    assert not move(env, poses['gripper_center'], poses['gripper_station'], duration=1.5, gripper=True)
+    assert not move(env, poses['station'], poses['entrance'], duration=1.5)
+    assert (env.mover_station_indices == 0).all()
+    assert np.linalg.norm(env.get_rail_mount_xy() - poses['station'][:, :2], axis=1).max() < 0.0005
+
+
+def test_putback_off_nominal_does_not_switch(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> None:
+    # the movers take the MagBot out of the station
+    assert not move(env, poses['initial'], poses['pre_station'], duration=1.5)
+    assert not move(env, poses['pre_station'], poses['entrance'], duration=1.5)
+    assert not move(env, poses['entrance'], poses['station'], duration=1.5)
+    assert not move(env, poses['gripper_station'], poses['gripper_center'], duration=1.5, gripper=True)
+    assert (env.mover_station_indices == -1).all()
+    # the MagBot is put back 3 mm (> station_switch_tol) in front of the nominal station pose
+    rot_station = env.stations[0].rotation_matrix_xy()
+    gripper_off = poses['gripper_station'].copy()
+    gripper_off[0, :2] += rot_station @ np.array([0.003, 0.0])
+    station_off = poses['station'].copy()
+    station_off[:, :2] += rot_station @ np.array([0.003, 0.0])
+    assert not move(env, poses['gripper_center'], gripper_off, duration=1.5, gripper=True)
+    # the movers try to leave along the entry axis -> the rail mounts are not welded to the station
+    move(env, station_off, station_off + (poses['entrance'] - poses['station']), duration=0.5, hold=0.0)
+    assert (env.mover_station_indices == -1).all()
