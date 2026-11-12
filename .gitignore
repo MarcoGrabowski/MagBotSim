@@ -210,3 +210,6 @@ docs/stl_list.rst
 
 # MacOS specific files
 .DS_Store
+
+# local generated outputs
+MUJOCO_LOG.TXT
