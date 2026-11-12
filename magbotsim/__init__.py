@@ -95,5 +95,17 @@ def register_gymnasium_envs():
                 entry_point=f'{path}:{env_name}B{i}',
             )
 
+    ###########################
+    # MagBot Reconfiguration #
+    ###########################
+    # one environment per MagBot type, since the number of movers (and thus the shapes of the spaces) depends on the MagBot type
+    for magbot_type, magbot_name in [('gripper', 'Gripper'), ('sixD_platform', 'SixDPlatform')]:
+        register(
+            id=f'ReconfigurationPlacement{magbot_name}Env-v0',
+            entry_point='magbotsim.rl_envs.magbots.reconfiguration_placement_env:ReconfigurationPlacementEnv',
+            kwargs={'magbot_types': (magbot_type,)},
+            max_episode_steps=100,
+        )
+
 
 register_gymnasium_envs()

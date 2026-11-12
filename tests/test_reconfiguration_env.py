@@ -70,20 +70,37 @@ def poses(env: ReconfigurationEnv) -> dict[str, np.ndarray]:
     return p
 
 
+COLLISION_KEYS = {'mover_collision', 'wall_collision', 'station_proxy_collision', 'rail_rod_collision', 'station_pin_collision'}
+
+
+def move_with_info(
+    env: ReconfigurationEnv, start: np.ndarray, end: np.ndarray, duration: float, magbot: bool = False, hold: float = 0.5
+) -> dict[str, bool]:
+    """Move the movers (or the MagBot gripper / platform) linearly from start to end and hold the end pose. The movement is stopped
+    at the first station proxy collision.
+
+    :return: the info dict returned by ``step()`` at the first station proxy collision, or of the last step if no station proxy
+        collision occurred
+    """
+    dt = env.cycle_time * NUM_CYCLES
+    setposes = [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))] + [end] * int(hold / dt)
+    info = dict.fromkeys(COLLISION_KEYS, False)
+    for setpose in setposes:
+        mover_setposes = env.get_mover_poses_from_magbot_setpose(magbot_setposes=setpose) if magbot else setpose
+        info = env.step(mover_setposes=mover_setposes, num_cycles=NUM_CYCLES)
+        # step() stops at the first collision, i.e. the colliding contacts are still present after step()
+        assert info['station_proxy_collision'] == env.check_station_proxy_collision()
+        if info['station_proxy_collision']:
+            break
+    return info
+
+
 def move(env: ReconfigurationEnv, start: np.ndarray, end: np.ndarray, duration: float, magbot: bool = False, hold: float = 0.5) -> bool:
     """Move the movers (or the MagBot gripper / platform) linearly from start to end and hold the end pose.
 
     :return: True if a station proxy collision occurred, False otherwise
     """
-    dt = env.cycle_time * NUM_CYCLES
-    setposes = [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))] + [end] * int(hold / dt)
-    for setpose in setposes:
-        mover_setposes = env.get_mover_poses_from_magbot_setpose(magbot_setposes=setpose) if magbot else setpose
-        env.step(mover_setposes=mover_setposes, num_cycles=NUM_CYCLES)
-        # step() stops at the first collision, i.e. the colliding contacts are still present after step()
-        if env.check_station_proxy_collision():
-            return True
-    return False
+    return move_with_info(env, start, end, duration, magbot=magbot, hold=hold)['station_proxy_collision']
 
 
 def proxy_contact_names(env: ReconfigurationEnv) -> list[str]:
@@ -111,7 +128,8 @@ def test_empty_movers_diagonal_entry_collides(env: ReconfigurationEnv, poses: di
     assert not move(env, poses['initial'], poses['pre_station'], duration=1.5)
     assert (env.mover_station_indices == 0).all()
     # the empty movers enter the station diagonally instead of along the entry axis -> the rail rods hit the jaws of the rail mounts
-    assert move(env, poses['pre_station'], poses['station'], duration=1.5)
+    info = move_with_info(env, poses['pre_station'], poses['station'], duration=1.5)
+    assert info['station_proxy_collision'] and info['rail_rod_collision'] and not info['station_pin_collision']
     assert env.check_station_proxy_collision()
     assert any('rail_rod' in names and '_lower_' in names for names in proxy_contact_names(env))
 
@@ -126,9 +144,37 @@ def test_magbot_diagonal_entry_collides(env: ReconfigurationEnv, poses: dict[str
     # the MagBot is shifted sideways (away from the station)
     assert not move(env, poses['magbot_center'], poses['magbot_shifted'], duration=1.0, magbot=True)
     # the MagBot is moved back into the station diagonally -> the rail mounts hit the station pins
-    assert move(env, poses['magbot_shifted'], poses['magbot_station'], duration=1.5, magbot=True)
+    info = move_with_info(env, poses['magbot_shifted'], poses['magbot_station'], duration=1.5, magbot=True)
+    assert info['station_proxy_collision'] and info['station_pin_collision']
     assert env.check_station_proxy_collision()
     assert any('_pins_' in names and '_upper_' in names for names in proxy_contact_names(env))
+
+
+# Tests of the info dict returned by step(), which contains the collision types.
+
+
+def test_step_returns_collision_info(env: ReconfigurationEnv) -> None:
+    info = env.step(mover_setposes=initial_poses(env), num_cycles=NUM_CYCLES)
+    assert set(info.keys()) == COLLISION_KEYS
+    assert all(value is False for value in info.values())
+
+
+@pytest.mark.parametrize('collision_type', ['wall_collision', 'mover_collision'])
+def test_step_info_mover_and_wall_collision(env: ReconfigurationEnv, collision_type: str) -> None:
+    start = initial_poses(env)
+    end = start.copy()
+    if collision_type == 'wall_collision':
+        end[0, 1] = -0.1  # mover 0 drives through the wall at y=0
+    else:
+        end[0, :2] = start[1, :2]  # mover 0 drives onto mover 1
+    dt = env.cycle_time * NUM_CYCLES
+    info = dict.fromkeys(COLLISION_KEYS, False)
+    for s in np.linspace(0.0, 1.0, int(1.5 / dt)):
+        info = env.step(mover_setposes=start + s * (end - start), num_cycles=NUM_CYCLES)
+        if any(info.values()):
+            break
+    assert info[collision_type]
+    assert not info['station_proxy_collision']
 
 
 # Tests of the randomization of the reconfiguration env: random collision-free mover start positions and random shift of the MagBot

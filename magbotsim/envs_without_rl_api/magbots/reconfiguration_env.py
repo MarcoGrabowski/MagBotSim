@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import itertools
+from typing import Any
 import numpy as np
 import mujoco
 from magbotsim import (
@@ -31,8 +32,19 @@ class ReconfigurationEnv(BasicMagBotEnv):
     controls the platform's beta-rotation (mover b) and connection 1 (rail mount 1) to the mover that controls the alpha-rotation
     (mover a), see ``SixDPlatformMagBotsAPM4330``.
 
-    The scene can be reset (and randomized) without reloading the model using ``reset_scene()``, e.g. from the reset callback of an RL
-    variant of this environment.
+    The scene can be reset (and randomized) without reloading the model using ``reset_scene()``, e.g. from the reset callback of the RL
+    variant of this environment (``ReconfigurationRLEnv``), which inherits from this class.
+
+    ``step()`` returns an info dictionary that contains the collision types (all bool), analogous to the RL environments:
+
+    - ``mover_collision``: collision between two movers
+    - ``wall_collision``: collision between a mover and a wall
+    - ``station_proxy_collision``: contact of any station collision proxy (rail mount proxy, rail rod or station pin) with any other
+      geom (see ``get_station_proxy_collisions()``)
+    - ``rail_rod_collision``: contact of a rail rod, e.g. an empty mover enters or leaves a station with a sideways misalignment
+      larger than the station proxy tolerance (the rail rod hits the jaws of a rail mount)
+    - ``station_pin_collision``: contact of a station pin, e.g. a MagBot carried by movers is moved into or out of a station with a
+      sideways misalignment larger than the station proxy tolerance (the rail mount hits the station pins)
 
     :param magbot_types: the MagBot types that can be used (see ``MAGBOT_TYPES``), defaults to both types. If several types are
         specified, the MagBot type is chosen randomly (``self.rng``) at initialization, otherwise the specified type is used. The chosen
@@ -152,6 +164,8 @@ class ReconfigurationEnv(BasicMagBotEnv):
         assert initial_mover_xy_pos is None or initial_mover_xy_pos.shape == (mover_count, 2), (
             f'initial_mover_xy_pos must have the shape ({mover_count}, 2) for the {self.magbot_type} MagBot'
         )
+        # fixed start positions of the chosen MagBot type (None: the start positions are sampled), e.g. reused at each RL reset
+        self.fixed_mover_start_xy_pos = None if initial_mover_xy_pos is None else initial_mover_xy_pos.copy()
 
         # stations (the station type depends on the MagBot type)
         if station_poses is None:
@@ -340,17 +354,17 @@ class ReconfigurationEnv(BasicMagBotEnv):
             self.impedance_controllers[idx_mover].update_cached_mujoco_data(self.model)
         self.magbots.update_cached_mujoco_data(self.model)
         self._update_cached_equality_ids()
-        # IDs of all station collision proxies (rail mount proxies and station pins)
-        self.geom_ids_proxy = np.array(
-            [
-                idx_geom
-                for idx_geom in range(0, self.model.ngeom)
-                if (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, idx_geom) or '').startswith(
-                    StationCollisionProxies.PROXY_NAME_PREFIX
-                )
-            ],
-            dtype=int,
-        )
+        # IDs of all station collision proxies (rail mount proxies, rail rods and station pins) and of the rail rods and station pins
+        proxy_geoms = {
+            idx_geom: name
+            for idx_geom in range(0, self.model.ngeom)
+            if (name := mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, idx_geom) or '').startswith(
+                StationCollisionProxies.PROXY_NAME_PREFIX
+            )
+        }
+        self.geom_ids_proxy = np.array(list(proxy_geoms.keys()), dtype=int)
+        self.geom_ids_rail_rod = np.array([idx_geom for idx_geom, name in proxy_geoms.items() if '_rail_rod' in name], dtype=int)
+        self.geom_ids_station_pin = np.array([idx_geom for idx_geom, name in proxy_geoms.items() if '_pins_' in name], dtype=int)
         # qpos addresses and joint IDs of the slide joints of the MagBot bases (used to shift the MagBots in their stations)
         self.jnt_ids_magbot_xy = np.array(
             [
@@ -532,15 +546,92 @@ class ReconfigurationEnv(BasicMagBotEnv):
         """
         return self.data.xpos[self.body_ids_rail_mount, :2].copy()
 
+    def get_station_proxy_collisions(self) -> dict[str, bool]:
+        """Check the current contacts of the station collision proxies (see ``StationCollisionProxies``). If a station is entered
+        correctly, the proxies are not in contact with anything.
+
+        :return: a dictionary with the following keys (bool values):
+
+            - ``station_proxy_collision``: whether any collision proxy (rail mount proxy, rail rod or station pin) is in contact with
+              any other geom (includes the two collision types below)
+            - ``rail_rod_collision``: whether a rail rod is in contact with any other geom, e.g. because an empty mover entered or
+              left a station with a sideways misalignment larger than the station proxy tolerance (the rail rod hits the jaws of a
+              rail mount)
+            - ``station_pin_collision``: whether a station pin is in contact with any other geom, e.g. because a MagBot carried by
+              movers was moved into or out of a station with a sideways misalignment larger than the station proxy tolerance (the
+              rail mount hits the station pins)
+        """
+        contact_geoms = self.data.contact.geom[: self.data.ncon]
+        return {
+            'station_proxy_collision': bool(np.isin(contact_geoms, self.geom_ids_proxy).any()),
+            'rail_rod_collision': bool(np.isin(contact_geoms, self.geom_ids_rail_rod).any()),
+            'station_pin_collision': bool(np.isin(contact_geoms, self.geom_ids_station_pin).any()),
+        }
+
     def check_station_proxy_collision(self) -> bool:
-        """Check whether a station collision proxy (rail mount proxy or station pin) is in contact with any other
+        """Check whether a station collision proxy (rail mount proxy, rail rod or station pin) is in contact with any other
         geom, e.g. because a mover or a MagBot entered a station with a sideways misalignment larger than the station proxy
         tolerance. If the station is entered correctly, the proxies are not in contact with anything.
 
         :return: True if a collision proxy is in contact with any other geom, False otherwise
         """
-        contact_geoms = self.data.contact.geom[: self.data.ncon]
-        return bool(np.isin(contact_geoms, self.geom_ids_proxy).any())
+        return self.get_station_proxy_collisions()['station_proxy_collision']
+
+    def _check_for_other_collisions_callback(self) -> tuple[bool, dict[str, bool]]:
+        """Check for collisions besides mover and wall collisions, i.e. contacts of the station collision proxies (see
+        ``get_station_proxy_collisions()``). This method has the signature of the corresponding callback of
+        ``BasicMagBotSingleAgentEnv``, i.e. it is also used by the RL variant of this environment.
+
+        :return:
+            - whether there is a station proxy collision (bool)
+            - a dictionary with the station proxy collision types (see ``get_station_proxy_collisions()``)
+        """
+        collision_info = self.get_station_proxy_collisions()
+        return collision_info['station_proxy_collision'], collision_info
+
+    def _check_collisions(self) -> tuple[bool, bool, bool, dict[str, bool]]:
+        """Check for mover, wall and other collisions (station collision proxies) in the current state. Noise is added to the mover
+        positions, since it would also occur in a real system.
+
+        :return: whether there is a mover collision, a wall collision or another collision (each bool), and a dictionary with the
+            station proxy collision types (see ``get_station_proxy_collisions()``)
+        """
+        wall_collision = self.check_wall_collision(
+            mover_names=self.mover_names, c_size=self.c_size, add_safety_offset=False, mover_qpos=None, add_qpos_noise=True
+        ).any()
+        mover_collision = self.check_mover_collision(
+            mover_names=self.mover_names, c_size=self.c_size, add_safety_offset=False, mover_qpos=None, add_qpos_noise=True
+        )
+        other_collision, collision_info = self._check_for_other_collisions_callback()
+        return bool(mover_collision), bool(wall_collision), bool(other_collision), collision_info
+
+    def _get_info(
+        self,
+        mover_collision: bool,
+        wall_collision: bool,
+        other_collision: bool,
+        achieved_goal: np.ndarray | None = None,
+        desired_goal: np.ndarray | None = None,
+        collision_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return a dictionary that contains the collision types. This method has the signature of the corresponding method of
+        ``BasicMagBotSingleAgentEnv``, i.e. it is also used by the RL variant of this environment.
+
+        :param mover_collision: whether there is a collision between two movers
+        :param wall_collision: whether there is a collision between a mover and a wall
+        :param other_collision: whether there is a station proxy collision (already contained in ``collision_info``)
+        :param achieved_goal: not used in this environment, defaults to None
+        :param desired_goal: not used in this environment, defaults to None
+        :param collision_info: a dictionary with the station proxy collision types (see ``get_station_proxy_collisions()``),
+            defaults to None. If None, the station proxy collisions are checked in the current state.
+        :return: the info dictionary with keys ``mover_collision``, ``wall_collision``, ``station_proxy_collision``,
+            ``rail_rod_collision`` and ``station_pin_collision`` (bool values)
+        """
+        if collision_info is None:
+            collision_info = self.get_station_proxy_collisions()
+        info = {'mover_collision': bool(mover_collision), 'wall_collision': bool(wall_collision)}
+        info.update({key: bool(value) for key, value in collision_info.items()})
+        return info
 
     def _update_cached_equality_ids(self) -> None:
         """Update the cached IDs of the mover and station welds of the rail mounts and of the bodies connected by the station welds."""
@@ -587,7 +678,7 @@ class ReconfigurationEnv(BasicMagBotEnv):
 
     def _update_equality_constraints(self, mover_pos_d: np.ndarray) -> None:
         """Switch the welds of the rail mounts between the movers and the stations based on the real rail mount positions. The switch
-        happens on the first step in which a mover leaves (i.e. the distance increases), so that the rail mount does not jump:
+        happens on the first step in which a mover leaves (i.e. the distance increases), so that the rail mount does not jump.
 
         - pick-up: the rail mount is parked in a station and the last mover set position is within the station switch tolerance of the
           real rail mount position. If the mover leaves along the take-out axis of the station, the rail mount is welded to the mover.
@@ -694,12 +785,50 @@ class ReconfigurationEnv(BasicMagBotEnv):
                 model=self.model, data=self.data, mover_a_quats=mover_quats[:, 0], mover_b_quats=mover_quats[:, 1]
             )
 
+    def _get_mover_quats_d(self, mover_setposes: np.ndarray) -> np.ndarray:
+        """Return the desired mover rotations for the impedance controllers. The c-rotations of the Gripper MagBot movers are controlled
+        by the MagBot (see ``__init__()``), i.e. the impedance controllers only keep the movers level.
+
+        :param mover_setposes: the desired mover poses (numpy array of shape (num_movers, 6) using Euler angles (xyz) in rad)
+        :return: the desired mover rotations as quaternions (numpy array of shape (num_movers, 4))
+        """
+        if self.magbot_type == 'gripper':
+            return np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (self.num_movers, 1))
+        return rotations_utils.vec_euler2quat(mover_setposes[:, 3:])
+
+    def _apply_mover_controls(self, mover_setposes: np.ndarray, mover_quats_d: np.ndarray | None = None) -> None:
+        """Calculate the controls of one control cycle, i.e. switch the welds of the rail mounts, update the mover impedance controllers
+        and couple the MagBot mechanics with the movers. This method must be called before each MuJoCo integrator step and is also used
+        by the RL variant of this environment.
+
+        :param mover_setposes: the desired mover poses in connection order (numpy array of shape (num_movers, 6) using Euler angles
+            (xyz) in rad)
+        :param mover_quats_d: the desired mover rotations (numpy array of shape (num_movers, 4)), defaults to None, i.e. they are
+            computed from ``mover_setposes`` (see ``_get_mover_quats_d()``)
+        """
+        quats_d = self._get_mover_quats_d(mover_setposes=mover_setposes) if mover_quats_d is None else mover_quats_d
+        # weld the rail mounts to the movers or the station
+        self._update_equality_constraints(mover_pos_d=mover_setposes)
+        # update controls for mover impedance controllers
+        for idx_mover in range(0, self.num_movers):
+            # movers whose rail mount is held by the station do not carry the MagBot
+            additional_mass = 0.0 if self.mover_station_indices[idx_mover] >= 0 else self.magbots.magbot_masses[0] / 2
+            self.impedance_controllers[idx_mover].update(
+                model=self.model,
+                data=self.data,
+                pos_d=mover_setposes[idx_mover, :3],
+                quat_d=quats_d[idx_mover],
+                additional_mass=additional_mass,
+            )
+        # control MagBot
+        self._control_magbot(mover_setposes=mover_setposes)
+
     def step(
         self,
         mover_setposes: np.ndarray,
         num_cycles: int = 40,
         render_every_cycle: bool = False,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Perform one or multiple simulation steps, including caluclation of mover controls, MuJoCo integrator steps, rendering, and
         collision checking. The remaining cycles are skipped if a collision is detected.
 
@@ -711,68 +840,42 @@ class ReconfigurationEnv(BasicMagBotEnv):
             False. Rendering every cycle leads to a smoother visualization of the scene, but can also be computationally expensive.
             Thus, this parameter provides the possibility to speed up training and evaluation. Regardless of this parameter, the scene
             is always rendered after ``num_cycles``
+        :return: the info dictionary with the collision types of the last executed cycle (see ``_get_info()``)
         """
         assert mover_setposes.shape == (self.num_movers, 6)
+        assert num_cycles >= 1
 
-        # desired mover rotations (the c-rotations of the Gripper MagBot movers are controlled by the MagBot, see __init__())
-        if self.magbot_type == 'gripper':
-            mover_quats_d = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (self.num_movers, 1))
-        else:
-            mover_quats_d = rotations_utils.vec_euler2quat(mover_setposes[:, 3:])
-
-        collision = False
+        mover_quats_d = self._get_mover_quats_d(mover_setposes=mover_setposes)
+        mover_collision, wall_collision, other_collision, collision_info = False, False, False, None
         for _ in range(0, num_cycles):
             # calculate controls
-
-            # weld the rail mounts to the movers or the station
-            self._update_equality_constraints(mover_pos_d=mover_setposes)
-            # update controls for mover impedance controllers
-            for idx_mover in range(0, self.num_movers):
-                # movers whose rail mount is held by the station do not carry the MagBot
-                additional_mass = 0.0 if self.mover_station_indices[idx_mover] >= 0 else self.magbots.magbot_masses[0] / 2
-                self.impedance_controllers[idx_mover].update(
-                    model=self.model,
-                    data=self.data,
-                    pos_d=mover_setposes[idx_mover, :3],
-                    quat_d=mover_quats_d[idx_mover],
-                    additional_mass=additional_mass,
-                )
-            # control MagBot
-            self._control_magbot(mover_setposes=mover_setposes)
-
+            self._apply_mover_controls(mover_setposes=mover_setposes, mover_quats_d=mover_quats_d)
             # integration
             mujoco.mj_step(self.model, self.data, nstep=1)
             # render every cycle for a smooth visualization of the movement
             if render_every_cycle:
                 self.render()
-            # check wall and mover collision every cycle to ensure that the collisions are detected and
-            # all intermediate mover positions are valid and without collisions
-            wall_collision = self.check_wall_collision(
-                mover_names=self.mover_names,
-                c_size=self.c_size,
-                add_safety_offset=False,
-                mover_qpos=None,
-                add_qpos_noise=True,  # would also occur in a real system
-            ).any()
-            mover_collision = self.check_mover_collision(
-                mover_names=self.mover_names,
-                c_size=self.c_size,
-                add_safety_offset=False,
-                mover_qpos=None,
-                add_qpos_noise=True,  # would also occur in a real system
-            )
-            station_proxy_collision = self.check_station_proxy_collision()
-            collision = bool(mover_collision or wall_collision or station_proxy_collision)
-            if collision:
+            # check collisions every cycle to ensure that the collisions are detected and all intermediate mover positions are valid
+            # and without collisions
+            mover_collision, wall_collision, other_collision, collision_info = self._check_collisions()
+            if mover_collision or wall_collision or other_collision:
                 break
 
         self.render()
+
+        return self._get_info(
+            mover_collision=mover_collision,
+            wall_collision=wall_collision,
+            other_collision=other_collision,
+            collision_info=collision_info,
+        )
 
 
 if __name__ == '__main__':
     # The demo loops through randomly initialized scenarios (MagBot type, station type and MagBot position in the station). For each
     # scenario, the movers pick up the MagBot from the station, take it out of the station, put it back and drive back to their
-    # initial positions. A new environment is created for each scenario, since the number of movers depends on the MagBot type.
+    # initial positions. The model only depends on the MagBot type (number of movers, MagBot and station type), i.e. a new environment
+    # (and viewer window) is only created if the MagBot type changes. Otherwise, the scene of the existing environment is reset.
     single_track = np.array([False])  # Gripper MagBot only
     # MagBot types from which the type of each scenario is chosen randomly
     magbot_types = ('gripper', 'sixD_platform')
@@ -833,7 +936,7 @@ if __name__ == '__main__':
 
         # the movers start with a yaw of 0 and rotate to the station yaw on their way to the entrance
         initial_mover_setposes = station_mover_setposes.copy()
-        initial_mover_setposes[:, :2] = env.initial_mover_xy_pos
+        initial_mover_setposes[:, :2] = env.mover_start_xy_pos  # start positions of the current scene
         initial_mover_setposes[:, 5] = 0.0
 
         dt = env.cycle_time * num_cycles  # [s] duration of one env step
@@ -878,22 +981,32 @@ if __name__ == '__main__':
         # 8) the movers drive back to their initial positions
         move_movers(pre_station_mover_setposes, initial_mover_setposes)
 
+    rng = np.random.default_rng(seed=0)
+    env: ReconfigurationEnv | None = None
     try:
-        for seed in itertools.count():
-            env = ReconfigurationEnv(
-                magbot_types=magbot_types,
-                initial_mover_xy_pos=initial_mover_xy_pos,
-                station_poses=station_poses,
-                randomize_magbot_station_pos=randomize_magbot_station_pos,
-                seed=seed,
-            )
+        for idx_scenario in itertools.count():
+            magbot_type = str(rng.choice(magbot_types))
+            if env is not None and env.magbot_type == magbot_type and env.window_viewer_is_running():
+                # same model: reset the scene in place (new MagBot offset if randomized), i.e. the viewer window stays open
+                env.reset_scene(mover_start_xy_pos=env.fixed_mover_start_xy_pos, rng=rng)
+            else:
+                # new MagBot type (or viewer window closed by the user): new model -> new environment and viewer window
+                if env is not None:
+                    env.close()
+                env = ReconfigurationEnv(
+                    magbot_types=(magbot_type,),
+                    initial_mover_xy_pos=initial_mover_xy_pos,
+                    station_poses=station_poses,
+                    randomize_magbot_station_pos=randomize_magbot_station_pos,
+                    seed=idx_scenario,
+                )
             print(
-                f'scenario {seed}: {env.magbot_type} MagBot in a {type(env.stations[0]).__name__}, MagBot offset along the station x-axis: '
-                f'{env.magbot_station_x_offsets * 1000} mm'
+                f'scenario {idx_scenario}: {env.magbot_type} MagBot in a {type(env.stations[0]).__name__}, MagBot offset along the station '
+                f'x-axis: {env.magbot_station_x_offsets * 1000} mm'
             )
-            try:
-                run_scenario(env)
-            finally:
-                env.close()
+            run_scenario(env)
     except KeyboardInterrupt:
         pass
+    finally:
+        if env is not None:
+            env.close()
