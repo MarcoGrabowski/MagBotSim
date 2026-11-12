@@ -5,7 +5,9 @@ from gymnasium.envs.registration import register
 from magbotsim.basic_magbot_env import BasicMagBotEnv
 from magbotsim.magbots.sixD_platform import SixDPlatformMagBotsAPM4330
 from magbotsim.magbots.gripper import GripperMagBotsAPM4330, GripperMagBotsAPM4330Params
+from magbotsim.stations.station import Station
 from magbotsim.stations.gripper_station import GripperStation
+from magbotsim.stations.platform_station import PlatformStation
 from magbotsim.stations.station_collision_proxies import StationCollisionProxies
 from magbotsim.rl_envs.basic_multi_agent_env import BasicMagBotMultiAgentEnv
 from magbotsim.rl_envs.basic_single_agent_env import BasicMagBotSingleAgentEnv
@@ -23,7 +25,9 @@ __all__ = [
     'Matplotlib2DViewer',
     'MoverImpedanceController',
     'MujocoViewerCollection',
+    'PlatformStation',
     'SixDPlatformMagBotsAPM4330',
+    'Station',
     'StationCollisionProxies',
 ]
 

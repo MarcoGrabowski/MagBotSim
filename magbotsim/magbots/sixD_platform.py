@@ -7,6 +7,7 @@ import mujoco
 from mujoco import MjModel, MjData
 from gymnasium import logger
 from magbotsim.utils import rotations_utils, mujoco_utils
+from magbotsim.stations.station_collision_proxies import StationCollisionProxies
 
 
 class SixDPlatformMagBotsAPM4330:
@@ -17,10 +18,30 @@ class SixDPlatformMagBotsAPM4330:
         x-axis) of a platform
     :param indices_mover_b: a numpy array of shape (num_magbots,) containing all indices of movers controlling the beta-rotation (around
         y-axis) of a platform
+    :param station_proxies: the hidden collision proxies for the station switch, defaults to None. If specified, the rail mount and mover
+        adapter meshes are visual-only, each rail mount gets a collision proxy and each mover adapter a rail rod (see
+        ``StationCollisionProxies``), which is required to park the MagBot in stations. If None, the meshes collide as usual.
+
+    The rail mounts are numbered as connections: connection 0 (``rail_mount_0``) is attached to the mover that controls the beta-rotation
+    (mover b), connection 1 (``rail_mount_1``) to the mover that controls the alpha-rotation (mover a). The rail mounts are welded to the
+    mover adapters (welds ``mover_weld_c0_{idx_magbot}`` and ``mover_weld_c1_{idx_magbot}``). The body frames of both rail mounts follow
+    the convention of ``StationCollisionProxies``: the x-axis is the axis along which an empty mover enters or leaves the rail mount and
+    the flat side of the rail mount is located at -x.
     """
 
-    def __init__(self, num_magbots: int, indices_mover_a: np.ndarray, indices_mover_b: np.ndarray) -> None:
+    # distance between the two rail mounts (= mover distance) in the default configuration in which the MagBot XML is generated
+    DEFAULT_MOVER_DIST = 0.402616  # [m]
+    NUM_CONNECTIONS = 2
+
+    def __init__(
+        self,
+        num_magbots: int,
+        indices_mover_a: np.ndarray,
+        indices_mover_b: np.ndarray,
+        station_proxies: StationCollisionProxies | None = None,
+    ) -> None:
         self.num_magbots = num_magbots
+        self.station_proxies = station_proxies
         self.magbots = []
 
         # minimum and maximum mover distance
@@ -51,6 +72,8 @@ class SixDPlatformMagBotsAPM4330:
         self.platform_joint_names = [f'ball_socket_joint_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
         # platform qpos
         self.platform_pose_site_names = [f'platform_pose_site_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
+        # slide joints of the MagBot bases (x, y)
+        self.base_xy_joint_names = [(f'platform_x_{idx_magbot}', f'platform_y_{idx_magbot}') for idx_magbot in range(0, self.num_magbots)]
 
     def _update_cached_platform_site_ids(self, model: MjModel) -> None:
         """Update platform site ids.
@@ -95,6 +118,14 @@ class SixDPlatformMagBotsAPM4330:
         self._update_cached_platform_qpos_indices(model)
         # platform site IDs
         self._update_cached_platform_site_ids(model)
+        # rail mount body IDs, [idx_magbot, idx_c]: rail mount of connection idx_c (0: mover b, 1: mover a)
+        self.rail_mount_body_ids = np.array(
+            [
+                [model.body(f'rail_mount_{idx_c}_{idx_magbot}').id for idx_c in range(0, self.NUM_CONNECTIONS)]
+                for idx_magbot in range(0, self.num_magbots)
+            ],
+            dtype=np.int32,
+        )
         # MagBot mass
         self.magbot_masses = np.zeros((self.num_magbots,))
         for idx_magbot in range(0, self.num_magbots):
@@ -130,8 +161,11 @@ class SixDPlatformMagBotsAPM4330:
             gear_ratio = self.gear_ratio_mover2platform_b
             idx_platform_euler = 1
 
+        # the difference between mover and platform c-rotation is wrapped to (-pi, pi], which is valid as long as the platform rotations
+        # are within the mechanical limits (see moverSetPose2PlatformSetPose)
+        rel_c_rot = np.angle(np.exp(1j * (mover_euler[:, 2] - platform_c_rot)))
         rot_error = platform_joint_euler[:, idx_platform_euler] - np.maximum(
-            np.minimum(gear_ratio * (mover_euler[:, 2] - platform_c_rot), self.max_platform_rot_ab), -self.max_platform_rot_ab
+            np.minimum(gear_ratio * rel_c_rot, self.max_platform_rot_ab), -self.max_platform_rot_ab
         )
         torque = -self.KP * rot_error
         return torque
@@ -175,18 +209,43 @@ class SixDPlatformMagBotsAPM4330:
         data.ctrl[self.platform_ab_actuator_ids[indices_magbots, 0]] = torques_a
         data.ctrl[self.platform_ab_actuator_ids[indices_magbots, 1]] = torques_b
 
-    def generate_magbot_xml_strings(self, initial_pos_xyz_mover_b: np.ndarray, custom_model_xml_strings: dict | None) -> dict:
-        """Generate the MuJoCo XML strings for all 6D-Platform MagBots and add them to the ``custom_model_xml_strings``-dict.
+    def generate_magbot_xml_strings(
+        self, initial_pos_xyz_mover_b: np.ndarray, custom_model_xml_strings: dict | None, initial_yaw: np.ndarray | None = None
+    ) -> dict:
+        """Generate the MuJoCo XML strings for all 6D-Platform MagBots and add them to the ``custom_model_xml_strings``-dict. The MagBots
+        are generated in their default configuration, i.e. the distance between the movers is ``DEFAULT_MOVER_DIST`` and the mover
+        rotations are equal to the platform c-rotation.
 
         :param initial_pos_xyz_mover_b: the initial x,y,z-positions for all movers that control the b rotation of the platforms.
             Shape: (num_magbots,3)
         :param custom_model_xml_strings: the current ``custom_model_xml_strings``-dict which is modified by this method
+        :param initial_yaw: the initial c-rotation of the platforms [rad], i.e. the direction from mover a to mover b, defaults to None
+            (no rotation, i.e. mover a is located at -x of mover b). Shape: (num_magbots,)
         :return: the modified ``custom_model_xml_strings``-dict
         """
         assert initial_pos_xyz_mover_b.shape == (self.num_magbots, 3)
+        if initial_yaw is None:
+            initial_yaw = np.zeros(self.num_magbots)
+        assert initial_yaw.shape == (self.num_magbots,)
 
         if custom_model_xml_strings is None:
             custom_model_xml_strings = {}
+
+        # rail mount and mover adapter meshes are visual-only if the station collision proxies are used
+        contact_attr = ' contype="0" conaffinity="0"' if self.station_proxies is not None else ''
+
+        def rail_rod(idx_mover: int) -> str:
+            """Return the XML string of the rail rod of a mover adapter (empty if no station collision proxies are used)."""
+            if self.station_proxies is None:
+                return ''
+            return '\n' + self.station_proxies.rail_rod_xml_str(body_name=f'm_{idx_mover}_rail_rod')
+
+        def rail_mount_proxy(idx_c: int, idx_magbot: int) -> str:
+            """Return the XML string of the rail mount collision proxy (empty if no station collision proxies are used)."""
+            if self.station_proxies is None:
+                return ''
+            # both rail mount body frames follow the convention of the proxies (flat side at -x), i.e. no mirroring
+            return '\n' + self.station_proxies.rail_mount_proxy_xml_str(body_name=f'rail_mount_{idx_c}_{idx_magbot}_proxy', mirror_x=False)
 
         for idx_magbot in range(0, self.num_magbots):
             # assets
@@ -224,6 +283,8 @@ class SixDPlatformMagBotsAPM4330:
                     '\t\t<mesh name="toothed_belt_long_mesh" file="./magbots/6D_platform_XPlanar_APM4330/toothed_belt_long.stl" '
                     'scale="1 1 1" />',
                 ]
+                if self.station_proxies is not None:
+                    platform_assets_list.append(self.station_proxies.assets_xml_str())
                 platform_assets_xml_str = '\n'.join(platform_assets_list)
                 custom_assets_xml_str = custom_model_xml_strings.get('custom_assets_xml_str', None)
                 if custom_assets_xml_str is not None:
@@ -236,12 +297,13 @@ class SixDPlatformMagBotsAPM4330:
             mover_body_xml_strs = custom_model_xml_strings.get('custom_mover_body_xml_str_list')
             assert isinstance(mover_body_xml_strs, list), 'custom_mover_body_xml_str_list must be a list'
             # mover a
+            # the rail sites are aligned with the rail mount sites in the default configuration (required by the mover welds)
             mover_body_a_list = [
                 f'\n\t\t\t<body name="m_{self.indices_mover_a[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 -1.5708">',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_a[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                'pos="0 0 0" material="green"/>',
-                f'\t\t\t\t<site name="m_{self.indices_mover_a[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 -1.5708" size="0.001" '
-                'type="sphere"/>',
+                f'pos="0 0 0" material="green"{contact_attr}/>',
+                f'\t\t\t\t<site name="m_{self.indices_mover_a[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 1.5708" size="0.001" '
+                'type="sphere"/>' + rail_rod(self.indices_mover_a[idx_magbot]),
                 '\t\t\t</body>',
             ]
             mover_body_a_xml_str = '\n'.join(mover_body_a_list)
@@ -250,8 +312,9 @@ class SixDPlatformMagBotsAPM4330:
             mover_body_b_list = [
                 f'\n\t\t\t<body name="m_{self.indices_mover_b[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 1.5708">',
                 f'\t\t\t\t<geom name="m_{self.indices_mover_b[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                'pos="0 0 0" material="green"/>',
-                f'\t\t\t\t<site name="m_{self.indices_mover_b[idx_magbot]}_rail_site" pos="0 0 0" size="0.001" type="sphere"/>',
+                f'pos="0 0 0" material="green"{contact_attr}/>',
+                f'\t\t\t\t<site name="m_{self.indices_mover_b[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 1.5708" size="0.001" '
+                'type="sphere"/>' + rail_rod(self.indices_mover_b[idx_magbot]),
                 '\t\t\t</body>',
             ]
             mover_body_b_xml_str = '\n'.join(mover_body_b_list)
@@ -263,22 +326,24 @@ class SixDPlatformMagBotsAPM4330:
                 f'\n\t\t<!-- 6D-Platform MagBot {idx_magbot} -->',
                 f'\t\t<body name="6D_platform_magbot_{idx_magbot}" pos="{initial_pos_xyz_mover_b[idx_magbot, 0]} '
                 f'{initial_pos_xyz_mover_b[idx_magbot, 1]} {initial_pos_xyz_mover_b[idx_magbot, 2] + 0.012}" gravcomp="1" '
-                'euler="0 0 3.1416">',
+                f'euler="0 0 {initial_yaw[idx_magbot] + np.pi:.7f}">',
                 '\t\t\t<inertial mass="0.001" diaginertia="1e-6 1e-6 1e-6" pos="0 0 0"/>',
                 f'\t\t\t<joint name="platform_x_{idx_magbot}" type="slide" axis="1 0 0"/>',
                 f'\t\t\t<joint name="platform_y_{idx_magbot}" type="slide" axis="0 1 0"/>',
                 f'\t\t\t<joint name="platform_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
-                f'\t\t\t<body name="rail_mount_0_{idx_magbot}" pos="0.0 0.0 0.0" gravcomp="1" euler="0 0 -1.5708">',
-                f'\t\t\t\t<joint name="rail_mount_0_joint_{idx_magbot}" type="slide" axis="1 0 0" damping="0.1"/>',
+                '\t\t\t<!-- connection 0 (mover b) -->',
+                f'\t\t\t<body name="rail_mount_0_{idx_magbot}" pos="0.0 0.0 0.0" gravcomp="1">',
+                f'\t\t\t\t<joint name="rail_mount_0_joint_{idx_magbot}" type="slide" axis="0 -1 0" damping="0.1"/>',
                 f'\t\t\t\t<joint name="rail_mount_0_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_0_{idx_magbot}" type="mesh" mesh="rail_mount_mesh_a" mass="0.5" pos="0 0 0" '
-                'material="black"/>',
-                f'\t\t\t\t<site name="rail_mount_0_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>',
-                f'\t\t\t\t<body name="bevel_gear_A_0_{idx_magbot}" pos="0.0 0.0 0.038" gravcomp="1" euler="0 0 0">',
+                f'euler="0 0 -1.5708" material="black"{contact_attr}/>',
+                f'\t\t\t\t<site name="rail_mount_0_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
+                + rail_mount_proxy(0, idx_magbot),
+                f'\t\t\t\t<body name="bevel_gear_A_0_{idx_magbot}" pos="0.0 0.0 0.038" gravcomp="1" euler="0 0 -1.5708">',
                 f'\t\t\t\t\t<geom name="bevel_gear_A_0_geom_{idx_magbot}" type="mesh" mesh="bevel_gear_mesh" mass="0.01" pos="0 0 0" '
                 'material="off_white"/>',
                 '\t\t\t\t</body>',
-                f'\t\t\t\t<body name="rotation_plate_0_{idx_magbot}" pos="0.0 0.0 0.03" gravcomp="1" euler="0 0 1.5708">',
+                f'\t\t\t\t<body name="rotation_plate_0_{idx_magbot}" pos="0.0 0.0 0.03" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_0_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0" />',
                 f'\t\t\t\t\t<geom name="rotation_plate_geom_0_{idx_magbot}" type="mesh" mesh="rotation_plate_mesh" mass="0.01" pos="0 0 0" '
                 'material="black"/>',
@@ -433,12 +498,14 @@ class SixDPlatformMagBotsAPM4330:
                 '\t\t\t\t\t</body>',
                 '\t\t\t\t</body>',
                 '\t\t\t</body>',
-                f'\t\t\t<body name="rail_mount_1_{idx_magbot}" pos="0.402616 0.0 0.0" gravcomp="1" euler="0 0 3.1416">',
+                '\t\t\t<!-- connection 1 (mover a) -->',
+                f'\t\t\t<body name="rail_mount_1_{idx_magbot}" pos="{self.DEFAULT_MOVER_DIST} 0.0 0.0" gravcomp="1" euler="0 0 3.1416">',
                 f'\t\t\t\t<joint name="rail_mount_1_joint_{idx_magbot}" type="slide" axis="1 0 0" damping="0.1"/>',
                 f'\t\t\t\t<joint name="rail_mount_1_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_1_{idx_magbot}" type="mesh" mesh="rail_mount_mesh_b" mass="0.5" pos="0 0 0" '
-                'material="black"/>',
-                f'\t\t\t\t<site name="rail_mount_1_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>',
+                f'material="black"{contact_attr}/>',
+                f'\t\t\t\t<site name="rail_mount_1_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
+                + rail_mount_proxy(1, idx_magbot),
                 f'\t\t\t\t<body name="bevel_gear_B_0_{idx_magbot}" pos="0.0 0.0 0.038" gravcomp="1" euler="0 0 0">',
                 f'\t\t\t\t\t<geom name="bevel_gear_B_0_geom_{idx_magbot}" type="mesh" mesh="bevel_gear_mesh" mass="0.01" pos="0 0 0" '
                 'material="off_white"/>',
@@ -531,6 +598,13 @@ class SixDPlatformMagBotsAPM4330:
                 f'\t\t<exclude body1="rail_mount_1_{idx_magbot}" body2="rotation_plate_1_{idx_magbot}"/>',
                 f'\t\t<exclude body1="rail_mount_1_{idx_magbot}" body2="bevel_gear_B_0_{idx_magbot}"/>',
             ]
+            if self.station_proxies is not None:
+                # the rail mount proxies are located directly below the rotation plates and bevel gears of the rail mounts
+                for idx_c, bevel_gear in enumerate(['bevel_gear_A_0', 'bevel_gear_B_0']):
+                    platform_contact_list += [
+                        f'\t\t<exclude body1="rail_mount_{idx_c}_{idx_magbot}_proxy" body2="rotation_plate_{idx_c}_{idx_magbot}"/>',
+                        f'\t\t<exclude body1="rail_mount_{idx_c}_{idx_magbot}_proxy" body2="{bevel_gear}_{idx_magbot}"/>',
+                    ]
             platform_contact_xml_str = '\n'.join(platform_contact_list)
             custom_contact_xml_str = custom_model_xml_strings.get('custom_contact_xml_str', None)
             if custom_contact_xml_str is not None:
@@ -555,10 +629,11 @@ class SixDPlatformMagBotsAPM4330:
                 f'\t\t<joint joint1="toothed_belt_long_A_joint_{idx_magbot}" joint2="solid_connection_0_joint_{idx_magbot}"/>',
                 f'\t\t<connect site1="pb_hinge_p_{idx_magbot}" site2="sc1_hinge_p_{idx_magbot}" solref="0.005 1" solimp="0.9 0.95 0.001"/>',
                 f'\t\t<connect site1="pb_hinge_m_{idx_magbot}" site2="sc1_hinge_m_{idx_magbot}" solref="0.005 1" solimp="0.9 0.95 0.001"/>',
-                f'\t\t<connect site1="m_{self.indices_mover_a[idx_magbot]}_rail_site" site2="rail_mount_1_site_{idx_magbot}" '
-                'solref="0.001 1" solimp="0.9999 0.9999 0.001"/>',
-                f'\t\t<connect site1="m_{self.indices_mover_b[idx_magbot]}_rail_site" site2="rail_mount_0_site_{idx_magbot}" '
-                'solref="0.001 1" solimp="0.9999 0.9999 0.001"/>',
+                # welds between the mover adapters and the rail mounts (can be deactivated to park the MagBot in a station)
+                f'\t\t<weld name="mover_weld_c0_{idx_magbot}" site1="m_{self.indices_mover_b[idx_magbot]}_rail_site" '
+                f'site2="rail_mount_0_site_{idx_magbot}" solref="0.001 1" solimp="0.9999 0.9999 0.001"/>',
+                f'\t\t<weld name="mover_weld_c1_{idx_magbot}" site1="m_{self.indices_mover_a[idx_magbot]}_rail_site" '
+                f'site2="rail_mount_1_site_{idx_magbot}" solref="0.001 1" solimp="0.9999 0.9999 0.001"/>',
                 '\t</equality>',
             ]
             equality_xml_str = '\n'.join(equality_list)
@@ -746,6 +821,25 @@ class SixDPlatformMagBotsAPM4330:
         platform_pose[:, 4] = np.clip(-self.gear_ratio_mover2platform_b * rel_c_m_b, -self.max_platform_rot_ab, self.max_platform_rot_ab)
 
         return platform_pose
+
+    def get_mover_quats_from_rail_mounts(self, data: MjData) -> np.ndarray:
+        """Return the mover rotations that correspond to the current rail mount rotations, i.e. the rotations of the movers if they were
+        attached to the rail mounts (the mover welds align the rail mounts with the mover adapters). Unlike the real mover rotations,
+        these rotations are also valid if the movers are detached from the MagBot, e.g. if the rail mounts are held by a station. Only
+        the rotation about the z-axis is considered. Requires ``update_cached_mujoco_data()``.
+
+        :param data: mjData of the MuJoCo environment
+        :return: the mover rotations (quaternions (w,x,y,z)). Shape: (num_magbots,2,4). [:,0,:]: mover that controls the platform's
+            alpha-rotation (attached to rail mount 1); [:,1,:]: mover that controls the platform's beta-rotation (attached to rail mount 0)
+        """
+        xmat = data.xmat[self.rail_mount_body_ids].reshape((self.num_magbots, self.NUM_CONNECTIONS, 3, 3))
+        rail_mount_yaws = np.arctan2(xmat[:, :, 1, 0], xmat[:, :, 0, 0])
+        # mover a: rail mount 1 is rotated like the mover; mover b: rail mount 0 is rotated by pi relative to the mover
+        mover_yaws = np.stack([rail_mount_yaws[:, 1], rail_mount_yaws[:, 0] + np.pi], axis=1)
+        quats = np.zeros((self.num_magbots, 2, 4))
+        quats[:, :, 0] = np.cos(0.5 * mover_yaws)
+        quats[:, :, 3] = np.sin(0.5 * mover_yaws)
+        return quats
 
     def get_platform_pose(self, model: MjModel, data: MjData, indices_magbots: np.ndarray) -> np.ndarray:
         """Get the current pose of a MagBot's platform (measured at the center of the platform's surface). This method is vectorized

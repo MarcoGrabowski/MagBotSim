@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+import itertools
 import numpy as np
 import mujoco
 from magbotsim import (
@@ -6,26 +8,47 @@ from magbotsim import (
     GripperMagBotsAPM4330,
     GripperMagBotsAPM4330Params,
     GripperStation,
+    PlatformStation,
+    SixDPlatformMagBotsAPM4330,
+    Station,
     StationCollisionProxies,
 )
-from magbotsim.utils import geometry_2D_utils
+from magbotsim.utils import geometry_2D_utils, rotations_utils
 
 
 class ReconfigurationEnv(BasicMagBotEnv):
     """Simple benchmark environment for reconfiguration testing. At the beginning, the MagBot is in the station and the movers are
     free on the table at the positions ``initial_mover_xy_pos``.
 
+    Two MagBot types are supported, each with its own station type:
+
+    - ``'gripper'``: Gripper MagBot (3 movers) in a ``GripperStation``
+    - ``'sixD_platform'``: 6D-Platform MagBot (2 movers) in a ``PlatformStation``
+
+    The MagBot type is selected at initialization (``magbot_types``). The number of movers in the environment equals the number of
+    connections (rail mounts) of the MagBot. Mover ``idx_c`` is attached to connection ``idx_c``, i.e. all mover set poses and station
+    mover poses are given in connection order. For the 6D-Platform MagBot, connection 0 (rail mount 0) is attached to the mover that
+    controls the platform's beta-rotation (mover b) and connection 1 (rail mount 1) to the mover that controls the alpha-rotation
+    (mover a), see ``SixDPlatformMagBotsAPM4330``.
+
     The scene can be reset (and randomized) without reloading the model using ``reset_scene()``, e.g. from the reset callback of an RL
     variant of this environment.
 
-    :param initial_mover_xy_pos: the initial (x, y) positions of the movers on the table (numpy array of shape (num_movers, 2)) [m].
-        Defaults to None, i.e. the positions are sampled uniformly on the free space of the table (no wall, mover or parked rail mount
-        collisions).
-    :param station_poses: the poses of the m2 mounts of the stations (numpy array of shape (num_stations, 4): (x, y, z) position in m
-        and yaw in rad). The number of stations can differ from the number of MagBots, but there must be at least one station per
-        MagBot, since MagBot i is generated in station i. The rail mounts are welded to the station if a mover leaves the nominal
-        station position (see ``GripperStation.get_mover_poses()``) along the entry axis of the station, and welded to the mover if the
-        mover leaves the parked rail mount along the take-out axis.
+    :param magbot_types: the MagBot types that can be used (see ``MAGBOT_TYPES``), defaults to both types. If several types are
+        specified, the MagBot type is chosen randomly (``self.rng``) at initialization, otherwise the specified type is used. The chosen
+        type is stored in ``magbot_type``.
+    :param initial_mover_xy_pos: the initial (x, y) positions of the movers on the table [m]. Either a numpy array of shape
+        (num_movers, 2), which must fit the chosen MagBot type, or a dict {MagBot type: numpy array of shape (num_movers, 2)}, which is
+        required to specify positions if several MagBot types can be chosen. Defaults to None, i.e. the positions are sampled uniformly
+        on the free space of the table (no wall, mover or parked rail mount collisions). This also applies to MagBot types that are
+        missing in the dict.
+    :param station_poses: the poses of the station anchors (numpy array of shape (num_stations, 4): (x, y, z) position in m and yaw in
+        rad). The anchor is the m2 mount of a ``GripperStation`` and the corresponding point on the extrusion of a ``PlatformStation``,
+        i.e. both station types occupy the same place for the same pose. All stations have the station type of the chosen MagBot type.
+        The number of stations can differ from the number of MagBots, but there must be at least one station per MagBot, since MagBot
+        i is generated in station i. The rail mounts are welded to the station if a mover leaves the nominal station position (see
+        ``Station.get_mover_poses()``) along the entry axis of the station, and welded to the mover if the mover leaves the parked rail
+        mount along the take-out axis.
         Defaults to None, i.e. a single station at the top extrusion.
     :param station_switch_tol: the maximum distance between a rail mount and the nominal station position (put-back), or between a
         mover set position and a parked rail mount (pick-up), at which the welds are switched [m], defaults to 0.001
@@ -41,11 +64,21 @@ class ReconfigurationEnv(BasicMagBotEnv):
     :param render_mode: the render mode, defaults to 'human'. Use None to run without rendering (e.g. in tests).
     """
 
+    MAGBOT_TYPES = ('gripper', 'sixD_platform')
+    # station type and number of connections (= number of movers) of each MagBot type
+    STATION_CLASSES: dict[str, type[Station]] = {'gripper': GripperStation, 'sixD_platform': PlatformStation}
+    NUM_CONNECTIONS = {'gripper': GripperMagBotsAPM4330.NUM_CONNECTIONS, 'sixD_platform': SixDPlatformMagBotsAPM4330.NUM_CONNECTIONS}
     DEFAULT_STATION_POSES = np.array([[0.480, 0.720, 0.01, np.deg2rad(-90)]])  # single station at the top extrusion
+    # MuJoCo options of the Gripper MagBot (set by GripperMagBotsAPM4330), which are also used for the 6D-Platform MagBot
+    OPTION_XML_STR = (
+        '\t<option timestep="0.001" cone="elliptic" jacobian="dense" gravity="0 0 -9.81" '
+        'integrator="implicitfast"><flag diagexact="enable"/></option>'
+    )
 
     def __init__(
         self,
-        initial_mover_xy_pos: np.ndarray | None = None,
+        magbot_types: Sequence[str] = MAGBOT_TYPES,
+        initial_mover_xy_pos: np.ndarray | dict[str, np.ndarray] | None = None,
         station_poses: np.ndarray | None = None,
         station_switch_tol: float = 0.001,
         station_proxy_tol: float = 0.002,
@@ -54,69 +87,93 @@ class ReconfigurationEnv(BasicMagBotEnv):
         seed: int | None = None,
         render_mode: str | None = 'human',
     ) -> None:
-        mover_count = 3
-
-        # mover parameters, collision parameters and initial start positions
-        mover_mass = np.array([1.264] * mover_count)
-        bumper_mass = np.array([0.05] * mover_count)
-        mover_params = {
-            'shape': 'mesh',
-            'mesh': {'mover_stl_path': ['beckhoff_apm4330_mover'] * mover_count, 'bumper_stl_path': ['beckhoff_apm4330_bumper'] * mover_count},
-            'mass': mover_mass - bumper_mass,
-            'bumper_mass': bumper_mass,
-        }
-        collision_params = {'shape': 'box', 'size': np.array([[0.155 / 2, 0.155 / 2]] * mover_count) + 0.001}
-
-        # mover distance m0-m1 of the MagBot model (configuration in which the MagBot XML is generated)
-        self.initial_m0m1_xy_dist = np.array([0.48, 0.0])  # [m]
-        self.initial_mover_z_pos = 0.001
-
-        # MagBots
-        self.num_magbots = 1  # <-- number of MagBots in this environment
-        self.indices_mover_c0 = np.array([0])  # <-- movers attached to connection 0
-        self.indices_mover_c1 = np.array([1])  # <-- movers attached to connection 1
-        self.indices_mover_c2 = np.array([2])  # <-- movers attached to connection 2
-        self.magbot_params = GripperMagBotsAPM4330Params()
-        # hidden collision proxies of the rail mounts and the station pins
-        self.station_proxies = StationCollisionProxies(tol=station_proxy_tol)
-        self.magbots = GripperMagBotsAPM4330(
-            num_magbots=self.num_magbots,
-            indices_mover_c0=self.indices_mover_c0,
-            indices_mover_c1=self.indices_mover_c1,
-            indices_mover_c2=self.indices_mover_c2,
-            magbot_params=self.magbot_params,
-            cycle_time=0.001,  # timestep of the MuJoCo model (specified by the MagBot)
-            station_proxies=self.station_proxies,
-        )
-
-        # initial mover positions (movers free on the table); None: sampled in reset_scene()
-        assert initial_mover_xy_pos is None or initial_mover_xy_pos.shape == (mover_count, 2)
-
         # randomization
         self.rng = np.random.default_rng(seed)
         self.randomize_magbot_station_pos = randomize_magbot_station_pos
         assert magbot_station_randomization_x_range >= 0.0
         self.magbot_station_randomization_x_range = magbot_station_randomization_x_range
 
+        # MagBot type (chosen randomly if several types are specified)
+        magbot_types = tuple(dict.fromkeys(magbot_types))  # remove duplicates, keep order
+        assert len(magbot_types) > 0, 'at least one MagBot type is required'
+        assert set(magbot_types) <= set(self.MAGBOT_TYPES), f'unknown MagBot type, valid types: {self.MAGBOT_TYPES}'
+        self.magbot_type = magbot_types[0] if len(magbot_types) == 1 else str(self.rng.choice(magbot_types))
+        mover_count = self.NUM_CONNECTIONS[self.magbot_type]
+
+        # mover parameters, collision parameters and initial start positions
+        mover_mass = np.array([1.264] * mover_count)
+        bumper_mass = np.array([0.05] * mover_count)
+        mover_params = {
+            'shape': 'mesh',
+            'mesh': {
+                'mover_stl_path': ['beckhoff_apm4330_mover'] * mover_count,
+                'bumper_stl_path': ['beckhoff_apm4330_bumper'] * mover_count,
+            },
+            'mass': mover_mass - bumper_mass,
+            'bumper_mass': bumper_mass,
+        }
+        collision_params = {'shape': 'box', 'size': np.array([[0.155 / 2, 0.155 / 2]] * mover_count) + 0.001}
+
+        # mover distance m0-m1 of the Gripper MagBot model (configuration in which the MagBot XML is generated)
+        self.initial_m0m1_xy_dist = np.array([0.48, 0.0])  # [m]
+        self.initial_mover_z_pos = 0.001
+
+        # MagBots
+        self.num_magbots = 1  # <-- number of MagBots in this environment
+        self.num_connections = mover_count
+        # [idx_c]: indices of the movers attached to connection idx_c (one per MagBot)
+        self.indices_mover_c = [np.array([idx_c]) for idx_c in range(0, self.num_connections)]
+        # hidden collision proxies of the rail mounts and the station pins
+        self.station_proxies = StationCollisionProxies(tol=station_proxy_tol)
+        if self.magbot_type == 'gripper':
+            self.magbot_params = GripperMagBotsAPM4330Params()
+            self.magbots = GripperMagBotsAPM4330(
+                num_magbots=self.num_magbots,
+                indices_mover_c0=self.indices_mover_c[0],
+                indices_mover_c1=self.indices_mover_c[1],
+                indices_mover_c2=self.indices_mover_c[2],
+                magbot_params=self.magbot_params,
+                cycle_time=0.001,  # timestep of the MuJoCo model (specified by the MagBot)
+                station_proxies=self.station_proxies,
+            )
+        else:
+            # connection 0 (rail mount 0) is attached to mover b, connection 1 (rail mount 1) to mover a
+            self.magbots = SixDPlatformMagBotsAPM4330(
+                num_magbots=self.num_magbots,
+                indices_mover_a=self.indices_mover_c[1],
+                indices_mover_b=self.indices_mover_c[0],
+                station_proxies=self.station_proxies,
+            )
+
+        # initial mover positions (movers free on the table); None: sampled in reset_scene()
+        if isinstance(initial_mover_xy_pos, dict):
+            assert set(initial_mover_xy_pos.keys()) <= set(self.MAGBOT_TYPES), f'unknown MagBot type, valid types: {self.MAGBOT_TYPES}'
+            initial_mover_xy_pos = initial_mover_xy_pos.get(self.magbot_type, None)
+        assert initial_mover_xy_pos is None or initial_mover_xy_pos.shape == (mover_count, 2), (
+            f'initial_mover_xy_pos must have the shape ({mover_count}, 2) for the {self.magbot_type} MagBot'
+        )
+
+        # stations (the station type depends on the MagBot type)
         if station_poses is None:
             station_poses = self.DEFAULT_STATION_POSES
         assert station_poses.ndim == 2 and station_poses.shape[1] == 4
         self.num_stations = station_poses.shape[0]
         assert self.num_stations >= self.num_magbots, 'MagBot i is generated in station i, i.e. at least one station per MagBot required'
+        station_class = self.STATION_CLASSES[self.magbot_type]
         self.stations = [
-            GripperStation(pos=station_poses[idx_station, :3], yaw=station_poses[idx_station, 3], name=f'station_{idx_station}')
+            station_class(pos=station_poses[idx_station, :3], yaw=station_poses[idx_station, 3], name=f'station_{idx_station}')
             for idx_station in range(0, self.num_stations)
         ]
         self.station_switch_tol = station_switch_tol
 
         # mover set poses at the stations (the equality constraints of the rail mounts are only switched at these positions)
-        # shape: (num_stations, 3, 6), [:, idx_c, :]: pose of the mover attached to connection idx_c
+        # shape: (num_stations, num_connections, 6), [:, idx_c, :]: pose of the mover attached to connection idx_c
         self.station_mover_poses = np.array([station.get_mover_poses(z_m=self.initial_mover_z_pos) for station in self.stations])
 
         # MagBot and connection to which each mover is attached
         self.mover_magbot_indices = np.zeros(mover_count, dtype=int)
         self.mover_connection_indices = np.zeros(mover_count, dtype=int)
-        for idx_c, indices_mover in enumerate([self.indices_mover_c0, self.indices_mover_c1, self.indices_mover_c2]):
+        for idx_c, indices_mover in enumerate(self.indices_mover_c):
             self.mover_magbot_indices[indices_mover] = np.arange(0, self.num_magbots)
             self.mover_connection_indices[indices_mover] = idx_c
 
@@ -137,15 +194,21 @@ class ReconfigurationEnv(BasicMagBotEnv):
 
         # impedance controller
         # the rotational damping is computed from the rotational inertia of the movers, which keeps the controller stable regardless of
-        # whether a mover carries the MagBot or not, i.e. the same rotational stiffness can be used in both cases
+        # whether a mover carries the MagBot or not, i.e. the same rotational stiffness can be used in both cases.
+        # The mover c-rotations of the Gripper MagBot are controlled by the MagBot (see GripperMagBotsAPM4330.control_gripper()), the
+        # mover c-rotations of the 6D-Platform MagBot by the impedance controllers.
+        if self.magbot_type == 'gripper':
+            joint_mask, rotational_stiffness = np.array([1, 1, 1, 1, 1, 0]), np.array([5.0, 5.0, 0.0])
+        else:
+            joint_mask, rotational_stiffness = np.array([1, 1, 1, 1, 1, 1]), np.array([5.0, 5.0, 5.0])
         self.impedance_controllers = [
             MoverImpedanceController(
                 model=self.model,
                 mover_joint_name=self.mover_joint_names[mover_idx],
                 mover_half_height=self.mover_size[mover_idx, 2],
-                joint_mask=np.array([1, 1, 1, 1, 1, 0]),
+                joint_mask=joint_mask,
                 translational_stiffness=np.array([5000.0, 5000.0, 10.0]),
-                rotational_stiffness=np.array([5.0, 5.0, 0.0]),
+                rotational_stiffness=rotational_stiffness,
             )
             for mover_idx in range(self.num_movers)
         ]
@@ -154,8 +217,47 @@ class ReconfigurationEnv(BasicMagBotEnv):
         self.reload_model(mover_start_xy_pos=initial_mover_xy_pos)
         self.initial_mover_xy_pos = self.mover_start_xy_pos.copy()
 
+    def _generate_magbot_xml_strings(self, custom_model_xml_strings: dict[str, str]) -> dict[str, str]:
+        """Generate the custom model XML strings for the MagBots in the stations (MagBot i in station i) and add them to the
+        ``custom_model_xml_strings``-dict. The pose of a MagBot is deduced from the station mover poses.
+
+        :param custom_model_xml_strings: the current ``custom_model_xml_strings``-dict which is modified by this method
+        :return: the modified ``custom_model_xml_strings``-dict
+        """
+        mover_qpos = self.get_mover_qpos(mover_names=self.mover_names, add_noise=False)
+        station_mover_xy_pos = self.station_mover_poses[: self.num_magbots, :, :2]  # (num_magbots, num_connections, 2)
+        # the MagBot-specific branches check the type of self.magbots (instead of self.magbot_type), so that type checkers can narrow it
+        if isinstance(self.magbots, GripperMagBotsAPM4330):
+            # the gripper is located in the middle between the movers of connections 0 and 1 and its yaw is given by the direction from
+            # connection 0 to connection 1. Connection 0 is located half the initial m0-m1 distance next to the gripper.
+            station_pos_xyz_c0 = mover_qpos[self.indices_mover_c[0], :3].copy()
+            station_xy_pos_c0, station_xy_pos_c1 = station_mover_xy_pos[:, 0], station_mover_xy_pos[:, 1]
+            station_c0c1_xy_dirs = station_xy_pos_c1 - station_xy_pos_c0
+            station_magbot_yaws = np.arctan2(station_c0c1_xy_dirs[:, 1], station_c0c1_xy_dirs[:, 0])
+            c, s, d = np.cos(station_magbot_yaws), np.sin(station_magbot_yaws), self.initial_m0m1_xy_dist
+            m0m1_xy_dists = np.stack([c * d[0] - s * d[1], s * d[0] + c * d[1]], axis=1)  # m0-m1 distance rotated by the MagBot yaw
+            station_pos_xyz_c0[:, :2] = 0.5 * (station_xy_pos_c0 + station_xy_pos_c1) - 0.5 * m0m1_xy_dists
+            return self.magbots.generate_magbot_xml_strings(
+                initial_pos_xyz_mover_c0=station_pos_xyz_c0,
+                custom_model_xml_strings=custom_model_xml_strings,
+                initial_yaw=station_magbot_yaws,
+            )
+        # 6D-Platform MagBot: the MagBot base is located at rail mount 0 (connection 0, mover b) and the platform c-rotation is given by
+        # the direction from mover a (connection 1) to mover b (connection 0)
+        station_pos_xyz_b = mover_qpos[self.indices_mover_c[0], :3].copy()
+        station_pos_xyz_b[:, :2] = station_mover_xy_pos[:, 0]
+        station_ab_xy_dirs = station_mover_xy_pos[:, 0] - station_mover_xy_pos[:, 1]
+        station_platform_yaws = np.arctan2(station_ab_xy_dirs[:, 1], station_ab_xy_dirs[:, 0])
+        custom_model_xml_strings = self.magbots.generate_magbot_xml_strings(
+            initial_pos_xyz_mover_b=station_pos_xyz_b,
+            custom_model_xml_strings=custom_model_xml_strings,
+            initial_yaw=station_platform_yaws,
+        )
+        custom_model_xml_strings['custom_option_xml_str'] = self.OPTION_XML_STR
+        return custom_model_xml_strings
+
     def _custom_xml_string_callback(self, custom_model_xml_strings: dict[str, str] | None = None) -> dict[str, str]:
-        """Add the MagBots and actuators for the movers to the MuJoCo model by modifying the ``custom_model_xml_strings``-dict.
+        """Add the MagBots, stations and actuators for the movers to the MuJoCo model by modifying the ``custom_model_xml_strings``-dict.
 
         :param custom_model_xml_strings: the current ``custom_model_xml_strings``-dict which is modified by this callback, defaults to None
         :return: the modified ``custom_model_xml_strings``-dict
@@ -165,31 +267,19 @@ class ReconfigurationEnv(BasicMagBotEnv):
             custom_model_xml_strings.update({'custom_mover_body_xml_str_list': [None] * self.num_movers})
 
         if hasattr(self, 'mover_joint_names'):
-            # generate custom model XML strings for the MagBots in the stations (MagBot i in station i). The pose of the MagBot is
-            # deduced from the station mover poses of connections 0 and 1: the gripper is located in the middle between both movers and
-            # its yaw is given by the direction from connection 0 to connection 1. Connection 0 is located half the initial m0-m1
-            # distance next to the gripper.
-            mover_qpos = self.get_mover_qpos(mover_names=self.mover_names, add_noise=False)
-            station_pos_xyz_c0 = mover_qpos[self.indices_mover_c0, :3].copy()
-            station_xy_pos_c0 = self.station_mover_poses[: self.num_magbots, 0, :2]
-            station_xy_pos_c1 = self.station_mover_poses[: self.num_magbots, 1, :2]
-            station_c0c1_xy_dirs = station_xy_pos_c1 - station_xy_pos_c0
-            station_magbot_yaws = np.arctan2(station_c0c1_xy_dirs[:, 1], station_c0c1_xy_dirs[:, 0])
-            c, s, d = np.cos(station_magbot_yaws), np.sin(station_magbot_yaws), self.initial_m0m1_xy_dist
-            m0m1_xy_dists = np.stack([c * d[0] - s * d[1], s * d[0] + c * d[1]], axis=1)  # m0-m1 distance rotated by the MagBot yaw
-            station_pos_xyz_c0[:, :2] = 0.5 * (station_xy_pos_c0 + station_xy_pos_c1) - 0.5 * m0m1_xy_dists
-            custom_model_xml_strings = self.magbots.generate_magbot_xml_strings(
-                initial_pos_xyz_mover_c0=station_pos_xyz_c0,
-                custom_model_xml_strings=custom_model_xml_strings,
-                initial_yaw=station_magbot_yaws,
-            )
+            # MagBots in the stations (MagBot i in station i)
+            custom_model_xml_strings = self._generate_magbot_xml_strings(custom_model_xml_strings=custom_model_xml_strings)
 
             # add actuators
             actuator_lines = ['\n\n\t<actuator>']
             for idx_mover in range(0, self.num_movers):
                 actuator_lines.append(self.impedance_controllers[idx_mover].generate_actuator_xml_string(idx_mover=idx_mover))
-            # MagBot gripper and mover c actuators
-            actuator_lines.append(self.magbots.generate_actuator_xml_strings())
+            if isinstance(self.magbots, GripperMagBotsAPM4330):
+                # MagBot gripper and mover c actuators
+                actuator_lines.append(self.magbots.generate_actuator_xml_strings())
+            else:
+                # MagBot platform a,b rot actuators
+                actuator_lines.append(self.magbots.generate_platform_abRot_actuator_xml_strings())
             # join
             actuator_lines.append('\n\t</actuator>')
             # station welds of the rail mounts (inactive at the beginning, switched by _update_equality_constraints())
@@ -207,8 +297,8 @@ class ReconfigurationEnv(BasicMagBotEnv):
             custom_assets_xml_str = custom_model_xml_strings['custom_assets_xml_str']
             application_assets_list = [
                 '\n\t\t<!-- assets reconfiguration benchmark -->',
-                # stations
-                GripperStation.generate_assets_xml_str(),
+                # stations (all stations have the same type)
+                type(self.stations[0]).generate_assets_xml_str(),
             ]
             application_assets_xml_str = '\n'.join(application_assets_list)
             custom_assets_xml_str += application_assets_xml_str
@@ -264,8 +354,8 @@ class ReconfigurationEnv(BasicMagBotEnv):
         # qpos addresses and joint IDs of the slide joints of the MagBot bases (used to shift the MagBots in their stations)
         self.jnt_ids_magbot_xy = np.array(
             [
-                [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f'gripper_{axis}_{idx_magbot}') for axis in ('x', 'y')]
-                for idx_magbot in range(0, self.num_magbots)
+                [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name) for joint_name in joint_names_xy]
+                for joint_names_xy in self.magbots.base_xy_joint_names
             ],
             dtype=int,
         )
@@ -283,7 +373,7 @@ class ReconfigurationEnv(BasicMagBotEnv):
         rng: np.random.Generator | None = None,
     ) -> None:
         """Reset the scene without reloading the model: MagBot i is parked in station i (optionally shifted along the station x-axis) and
-        the movers are free on the table. The MuJoCo data, the welds of the rail mounts and the gripper controller states are reset.
+        the movers are free on the table. The MuJoCo data, the welds of the rail mounts and the MagBot controller states are reset.
         This method can be reused by the reset callback of an RL variant of this environment.
 
         :param mover_start_xy_pos: the (x,y) start positions of the movers (numpy array of shape (num_movers,2)) [m], defaults to None.
@@ -296,7 +386,8 @@ class ReconfigurationEnv(BasicMagBotEnv):
         rng = self.rng if rng is None else rng
 
         mujoco.mj_resetData(self.model, self.data)
-        self.magbots.reset_yaw_extractor()
+        if isinstance(self.magbots, GripperMagBotsAPM4330):
+            self.magbots.reset_yaw_extractor()
         self.last_mover_pos_d = None
 
         # shift the MagBots in their stations
@@ -546,26 +637,62 @@ class ReconfigurationEnv(BasicMagBotEnv):
 
         self.last_mover_pos_d = mover_pos_d.copy()
 
-    def get_mover_poses_from_gripper_setPose(
-        self,
-        gripper_setposes: np.ndarray,
-        single_track: bool = False,
-        ) ->np.ndarray:
-        """Returns the mover poses resulting from a gripper set pose.
+    def get_mover_poses_from_magbot_setpose(self, magbot_setposes: np.ndarray, single_track: bool | np.ndarray = False) -> np.ndarray:
+        """Return the mover set poses resulting from MagBot set poses (inverse kinematics of the MagBot).
 
-        :param gripper_setposes (np.ndarray): the desired target positions of the MagBot grippers (numpy array of shape (num_magbots, 7) using Euler
-            angles (xyz) in rad). The 7th entry is the desired distance between the two gripper fingers in m. Ignored (can be None) if
-            ``mover_setposes`` is specified.
-        :param single_track (bool, optional): whether to calculate the mover set positions in single-track mode, defaults to False
-
-        Returns:
-            np.ndarray: _description_
+        :param magbot_setposes: the desired MagBot set poses (using Euler angles (xyz) in rad). Gripper MagBot: gripper poses (numpy
+            array of shape (num_magbots, 7)), the 7th entry is the desired distance between the two gripper fingers in m. 6D-Platform
+            MagBot: platform poses (numpy array of shape (num_magbots, 6)).
+        :param single_track: whether to calculate the mover set positions in single-track mode, defaults to False. Only used for the
+            Gripper MagBot.
+        :return: the mover set poses in connection order (numpy array of shape (num_movers, 6) using Euler angles (xyz) in rad)
         """
-        mover_poses = self.magbots.gripperSetPose2MoverSetPose(
-        gripper_pose_d=gripper_setposes, z_m=self.initial_mover_zpos, single_track=single_track
-        )
-        mover_poses = mover_poses.reshape((-1, 6))
-        return mover_poses
+        if isinstance(self.magbots, GripperMagBotsAPM4330):
+            mover_poses = self.magbots.gripperSetPose2MoverSetPose(
+                gripper_pose_d=magbot_setposes, z_m=self.initial_mover_zpos, single_track=single_track
+            )
+        else:
+            # [a, b] -> connection order [b, a] (the platform set poses are copied, since they are clipped in-place)
+            mover_poses = self.magbots.platformSetPose2MoverSetPose(
+                platform_pose_d=magbot_setposes.copy(), mover_z_d=float(self.initial_mover_zpos), use_euler=True
+            )[:, ::-1]
+        return mover_poses.reshape((-1, 6))
+
+    def get_magbot_setpose_from_mover_poses(self, mover_poses: np.ndarray) -> np.ndarray:
+        """Return the MagBot set poses resulting from mover set poses (forward kinematics of the MagBot).
+
+        :param mover_poses: the mover set poses in connection order (numpy array of shape (num_movers, 6) using Euler angles (xyz) in
+            rad)
+        :return: the MagBot set poses (using Euler angles (xyz) in rad). Gripper MagBot: gripper poses (numpy array of shape
+            (num_magbots, 7)). 6D-Platform MagBot: platform poses (numpy array of shape (num_magbots, 6)).
+        """
+        mover_poses = mover_poses.reshape((self.num_magbots, self.num_connections, 6))
+        if isinstance(self.magbots, GripperMagBotsAPM4330):
+            return self.magbots.moverSetPose2GripperSetPose(mover_poses=mover_poses)
+        # connection order [b, a] -> [a, b]
+        return self.magbots.moverSetPose2PlatformSetPose(mover_poses=mover_poses[:, ::-1], use_euler=True)
+
+    def _control_magbot(self, mover_setposes: np.ndarray) -> None:
+        """Couple the MagBot mechanics with the movers (gripper rotations and fingers, or platform a,b-rotations).
+
+        :param mover_setposes: the desired mover poses (numpy array of shape (num_movers, 6) using Euler angles (xyz) in rad)
+        """
+        if isinstance(self.magbots, GripperMagBotsAPM4330):
+            current_mover_qpos = self.get_mover_qpos(mover_names=self.mover_names, add_noise=False)
+            current_mover_qvels = self.get_mover_qvel(mover_names=self.mover_names, add_noise=False)
+            self.magbots.control_gripper(
+                model=self.model,
+                data=self.data,
+                mover_poses_d=mover_setposes,
+                current_mover_qpos=current_mover_qpos,
+                current_mover_qvels=current_mover_qvels,
+            )
+        else:
+            # the platform a,b-rotations result from the rail mount rotations, which are held by the movers or by the station
+            mover_quats = self.magbots.get_mover_quats_from_rail_mounts(data=self.data)
+            self.magbots.control_platform_ab_rot(
+                model=self.model, data=self.data, mover_a_quats=mover_quats[:, 0], mover_b_quats=mover_quats[:, 1]
+            )
 
     def step(
         self,
@@ -576,21 +703,27 @@ class ReconfigurationEnv(BasicMagBotEnv):
         """Perform one or multiple simulation steps, including caluclation of mover controls, MuJoCo integrator steps, rendering, and
         collision checking. The remaining cycles are skipped if a collision is detected.
 
-        :param mover_setposes: The desired mover poses (numpy array of shape (num_movers, 6) using Euler angles (xyz) in rad). 
-            The movers are controlled directly instead of via the gripper set poses, e.g. to move the movers away from a MagBot in the station.
+        :param mover_setposes: The desired mover poses in connection order (numpy array of shape (num_movers, 6) using Euler angles (xyz)
+            in rad). The movers are controlled directly instead of via the MagBot set poses, e.g. to move the movers away from a MagBot in
+            the station (see ``get_mover_poses_from_magbot_setpose()`` to control the MagBot).
         :param num_cycles: the number of control cycles for which to apply the same controls, defaults to 40
         :param render_every_cycle: whether to call ``render()`` after each integrator step in the ``step()`` method, defaults to
             False. Rendering every cycle leads to a smoother visualization of the scene, but can also be computationally expensive.
             Thus, this parameter provides the possibility to speed up training and evaluation. Regardless of this parameter, the scene
             is always rendered after ``num_cycles``
         """
-        
         assert mover_setposes.shape == (self.num_movers, 6)
+
+        # desired mover rotations (the c-rotations of the Gripper MagBot movers are controlled by the MagBot, see __init__())
+        if self.magbot_type == 'gripper':
+            mover_quats_d = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (self.num_movers, 1))
+        else:
+            mover_quats_d = rotations_utils.vec_euler2quat(mover_setposes[:, 3:])
 
         collision = False
         for _ in range(0, num_cycles):
             # calculate controls
-            
+
             # weld the rail mounts to the movers or the station
             self._update_equality_constraints(mover_pos_d=mover_setposes)
             # update controls for mover impedance controllers
@@ -601,20 +734,11 @@ class ReconfigurationEnv(BasicMagBotEnv):
                     model=self.model,
                     data=self.data,
                     pos_d=mover_setposes[idx_mover, :3],
-                    quat_d=np.array([1, 0, 0, 0]),
+                    quat_d=mover_quats_d[idx_mover],
                     additional_mass=additional_mass,
                 )
-            # control gripper
-            current_mover_qpos = self.get_mover_qpos(mover_names=self.mover_names, add_noise=False)
-            current_mover_qvels = self.get_mover_qvel(mover_names=self.mover_names, add_noise=False)
-
-            self.magbots.control_gripper(
-                model=self.model,
-                data=self.data,
-                mover_poses_d=mover_setposes,
-                current_mover_qpos=current_mover_qpos,
-                current_mover_qvels=current_mover_qvels,
-            )
+            # control MagBot
+            self._control_magbot(mover_setposes=mover_setposes)
 
             # integration
             mujoco.mj_step(self.model, self.data, nstep=1)
@@ -646,125 +770,130 @@ class ReconfigurationEnv(BasicMagBotEnv):
 
 
 if __name__ == '__main__':
-    single_track = np.array([False])
+    # The demo loops through randomly initialized scenarios (MagBot type, station type and MagBot position in the station). For each
+    # scenario, the movers pick up the MagBot from the station, take it out of the station, put it back and drive back to their
+    # initial positions. A new environment is created for each scenario, since the number of movers depends on the MagBot type.
+    single_track = np.array([False])  # Gripper MagBot only
+    # MagBot types from which the type of each scenario is chosen randomly
+    magbot_types = ('gripper', 'sixD_platform')
     # randomize the position of the MagBot in the station (shift along the station pins)
-    randomize_magbot_station_pos = True 
+    randomize_magbot_station_pos = True
 
-    # initial mover positions (movers free on the table); use None to sample random collision-free start positions (note that the
-    # straight-line paths of this example are only collision-free for suitable start positions)
-    initial_mover_xy_pos = np.array(
-        [[0.250, 0.150],
-         [0.710, 0.150],
-         [0.480, 0.150],
-         ])  # [m]
+    # fixed initial mover positions (movers free on the table) for each MagBot type in connection order; use None to sample random
+    # collision-free start positions (note that the straight-line paths of this example are only collision-free for suitable start
+    # positions)
+    initial_mover_xy_pos = {
+        'gripper': np.array([[0.250, 0.150], [0.710, 0.150], [0.480, 0.150]]),  # [m]
+        # connection 0 (mover b) is parked at the +x side of the station, connection 1 (mover a) at the -x side
+        'sixD_platform': np.array([[0.710, 0.150], [0.250, 0.150]]),  # [m]
+    }
 
-    # station at the top extrusion (pose of the m2 mount: x, y, z, yaw)
+    # station at the top extrusion (pose of the station anchor: x, y, z, yaw)
     station_poses = np.array([[0.480, 0.720, 0.01, np.deg2rad(-90)]])
-    env = ReconfigurationEnv(
-        initial_mover_xy_pos=initial_mover_xy_pos,
-        station_poses=station_poses,
-        randomize_magbot_station_pos=randomize_magbot_station_pos,
-    )
-    print(f'MagBot offset along the station x-axis: {env.magbot_station_x_offsets * 1000} mm')
 
-    # hardcoded offsets in the station body frame (x-axis: out of the station, y-axis: entry axis of the station), rotated into the world frame
-    entrance_offsets = np.array([[0.0, -0.145], [0.0, 0.145], [0.0, 0.145]])  # [m]
-
+    # the movers enter and leave the station along the entry axis (y-axis of the station body frame) from this distance [m]
+    entrance_dist = 0.145
     # the movers carry the MagBot 0.25 m out of the station (center of the tiles)
     magbot_path = np.array([0.25, 0.0])  # [m]
 
-    station = env.stations[0]
-    rot_station = station.rotation_matrix_xy()
-    # nominal mover poses in the station (connection order); the MagBot is put back at these poses
-    station_mover_poses = station.get_mover_poses(z_m=env.initial_mover_z_pos)
-    center_mover_poses = station_mover_poses.copy()
-    center_mover_poses[:, :2] += rot_station @ magbot_path
-
-    station_gripper_pose = env.magbots.moverSetPose2GripperSetPose(mover_poses=station_mover_poses[np.newaxis])
-    center_gripper_pose = env.magbots.moverSetPose2GripperSetPose(mover_poses=center_mover_poses[np.newaxis])
-
-    def to_mover_order(poses_c: np.ndarray) -> np.ndarray:
-        """Convert mover poses in connection order (numpy array of shape (3, 6)) to mover order (numpy array of shape (num_movers, 6))."""
-        mover_poses = np.zeros((env.num_movers, 6))
-        for idx_c, indices_mover in enumerate([env.indices_mover_c0, env.indices_mover_c1, env.indices_mover_c2]):
-            mover_poses[indices_mover[0]] = poses_c[idx_c]
-        return mover_poses
-
-    def station_setposes(station_poses_c: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Mover set poses in the station, at the entrance of the station and at the pre-station point for the given mover poses in
-        the station (connection order). The pre-station point is the entrance shifted by -200 mm in world y, from where the movers
-        drive straight into the station."""
-        entrance_poses_c = station_poses_c.copy()
-        entrance_poses_c[:, :2] += entrance_offsets @ rot_station.T
-        pre_station_poses_c = entrance_poses_c.copy()
-        pre_station_poses_c[:, 1] -= 0.2  # [m]
-        return to_mover_order(station_poses_c), to_mover_order(entrance_poses_c), to_mover_order(pre_station_poses_c)
-
-    # put-back: nominal station poses
-    station_mover_setposes, entrance_mover_setposes, pre_station_mover_setposes = station_setposes(station_mover_poses)
-
-    # the movers start with a yaw of 0 and rotate to the station yaw on their way to the entrance
-    initial_mover_setposes = station_mover_setposes.copy()
-    initial_mover_setposes[:, :2] = env.initial_mover_xy_pos
-    initial_mover_setposes[:, 5] = 0.0
-
     num_cycles = 20
-    dt = env.magbots.cycle_time * num_cycles  # [s] duration of one env step
-    def interpolate(start: np.ndarray, end: np.ndarray, duration: float) -> list[np.ndarray]:
-        """Linearly interpolate between two set poses, i.e. one set pose per env step."""
-        return [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))]
-
     # movements defaults
     default_duration = 1.25
     default_hold_after_duration = 0.25
-    def move_movers(start: np.ndarray, end: np.ndarray, duration: float = default_duration, hold_after_duration: float = default_hold_after_duration) -> None:
-        for mover_setposes in interpolate(start, end, duration=duration):
-            env.step(mover_setposes=mover_setposes, num_cycles=num_cycles)
-        for mover_setposes in interpolate(end, end, duration=hold_after_duration):
-            env.step(mover_setposes=mover_setposes, num_cycles=num_cycles)
 
-    def move_gripper(start: np.ndarray, end: np.ndarray, duration: float = default_duration, hold_after_duration: float = default_hold_after_duration) -> None:
-        for gripper_setposes in interpolate(start, end, duration=duration):
-            mover_setposes = env.get_mover_poses_from_gripper_setPose(gripper_setposes=gripper_setposes, single_track=single_track)
-            env.step(mover_setposes=mover_setposes, num_cycles=num_cycles)
+    def run_scenario(env: ReconfigurationEnv) -> None:
+        """Pick up the MagBot, take it out of the station, put it back and drive the movers back to their initial positions."""
+        station = env.stations[0]
+        rot_station = station.rotation_matrix_xy()
+        # nominal mover poses in the station (connection order = mover order); the MagBot is put back at these poses
+        station_mover_poses = env.station_mover_poses[0].copy()
+        center_mover_poses = station_mover_poses.copy()
+        center_mover_poses[:, :2] += rot_station @ magbot_path
 
-        for gripper_setposes in interpolate(end, end, duration=hold_after_duration):
-            mover_setposes = env.get_mover_poses_from_gripper_setPose(gripper_setposes=gripper_setposes, single_track=single_track)
-            env.step(mover_setposes=mover_setposes, num_cycles=num_cycles)
+        station_magbot_pose = env.get_magbot_setpose_from_mover_poses(mover_poses=station_mover_poses)
+        center_magbot_pose = env.get_magbot_setpose_from_mover_poses(mover_poses=center_mover_poses)
+
+        # offsets of the station entrances in the station body frame (x-axis: out of the station, y-axis: entry axis of the station),
+        # rotated into the world frame; each mover enters from the flat side of its rail mount
+        entrance_offsets = np.stack([np.zeros(env.num_movers), entrance_dist * station.MOVER_ENTRY_SIGNS], axis=1) @ rot_station.T
+
+        def station_setposes(station_poses_c: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            """Mover set poses in the station, at the entrance of the station and at the pre-station point for the given mover poses in
+            the station. The pre-station point is the entrance shifted by -200 mm in world y, from where the movers drive straight
+            into the station.
+            """
+            entrance_poses_c = station_poses_c.copy()
+            entrance_poses_c[:, :2] += entrance_offsets
+            pre_station_poses_c = entrance_poses_c.copy()
+            pre_station_poses_c[:, 1] -= 0.2  # [m]
+            return station_poses_c, entrance_poses_c, pre_station_poses_c
+
+        # put-back: nominal station poses
+        station_mover_setposes, entrance_mover_setposes, pre_station_mover_setposes = station_setposes(station_mover_poses)
+
+        # the movers start with a yaw of 0 and rotate to the station yaw on their way to the entrance
+        initial_mover_setposes = station_mover_setposes.copy()
+        initial_mover_setposes[:, :2] = env.initial_mover_xy_pos
+        initial_mover_setposes[:, 5] = 0.0
+
+        dt = env.cycle_time * num_cycles  # [s] duration of one env step
+
+        def interpolate(start: np.ndarray, end: np.ndarray, duration: float) -> list[np.ndarray]:
+            """Linearly interpolate between two set poses, i.e. one set pose per env step."""
+            return [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))]
+
+        def move_movers(
+            start: np.ndarray, end: np.ndarray, duration: float = default_duration, hold_after_duration: float = default_hold_after_duration
+        ) -> None:
+            for mover_setposes in interpolate(start, end, duration=duration) + interpolate(end, end, duration=hold_after_duration):
+                env.step(mover_setposes=mover_setposes, num_cycles=num_cycles)
+
+        def move_magbot(
+            start: np.ndarray, end: np.ndarray, duration: float = default_duration, hold_after_duration: float = default_hold_after_duration
+        ) -> None:
+            for magbot_setposes in interpolate(start, end, duration=duration) + interpolate(end, end, duration=hold_after_duration):
+                mover_setposes = env.get_mover_poses_from_magbot_setpose(magbot_setposes=magbot_setposes, single_track=single_track)
+                env.step(mover_setposes=mover_setposes, num_cycles=num_cycles)
+
+        # pick-up: the movers drive to the real positions of the parked rail mounts
+        pickup_poses_c = station_mover_poses.copy()
+        pickup_poses_c[:, :2] = env.get_rail_mount_xy()
+        pickup_mover_setposes, pickup_entrance_mover_setposes, pickup_pre_station_mover_setposes = station_setposes(pickup_poses_c)
+        pickup_magbot_pose = env.get_magbot_setpose_from_mover_poses(mover_poses=pickup_poses_c)
+
+        # 1) the movers drive from their initial positions to the pre-station point (200 mm in front of the station)
+        move_movers(initial_mover_setposes, pickup_pre_station_mover_setposes)
+        # 2) the movers drive straight into the station (+y)
+        move_movers(pickup_pre_station_mover_setposes, pickup_entrance_mover_setposes)
+        # 3) the movers enter the station along the entry axis (rail mounts still welded to the station)
+        move_movers(pickup_entrance_mover_setposes, pickup_mover_setposes)
+        # 4) the movers take the MagBot and move it along the take-out axis to the center (rail mounts welded to the movers)
+        move_magbot(pickup_magbot_pose, center_magbot_pose)
+        # 5) the movers move the MagBot back into the station (nominal station pose)
+        move_magbot(center_magbot_pose, station_magbot_pose)
+        # 6) the movers leave the station along the entry axis (rail mounts welded to the station)
+        move_movers(station_mover_setposes, entrance_mover_setposes)
+        # 7) the movers drive back to their pre station positions
+        move_movers(entrance_mover_setposes, pre_station_mover_setposes)
+        # 8) the movers drive back to their initial positions
+        move_movers(pre_station_mover_setposes, initial_mover_setposes)
 
     try:
-        while True:
-            # pick-up: the movers drive to the real positions of the parked rail mounts (connection order)
-            pickup_poses_c = station_mover_poses.copy()
-            pickup_poses_c[:, :2] = env.get_rail_mount_xy()[[env.indices_mover_c0[0], env.indices_mover_c1[0], env.indices_mover_c2[0]]]
-            pickup_mover_setposes, pickup_entrance_mover_setposes, pickup_pre_station_mover_setposes = station_setposes(pickup_poses_c)
-            pickup_gripper_pose = env.magbots.moverSetPose2GripperSetPose(mover_poses=pickup_poses_c[np.newaxis])
-
-            # 1) the movers drive from their initial positions to the pre-station point (200 mm in front of the station)
-            move_movers(initial_mover_setposes, pickup_pre_station_mover_setposes)
-
-            # 2) the movers drive straight into the station (+y)
-            move_movers(pickup_pre_station_mover_setposes, pickup_entrance_mover_setposes)
-
-            # 3) the movers enter the station along the entry axis (rail mounts still welded to the station)
-            move_movers(pickup_entrance_mover_setposes, pickup_mover_setposes)
-
-            # 4) the movers take the MagBot and move it along the take-out axis to the center (rail mounts welded to the movers)
-            move_gripper(pickup_gripper_pose, center_gripper_pose)
-
-            # 5) the movers move the MagBot back into the station (nominal station pose)
-            move_gripper(center_gripper_pose, station_gripper_pose)
-
-            # 6) the movers leave the station along the entry axis (rail mounts welded to the station)
-            move_movers(station_mover_setposes, entrance_mover_setposes)
-
-            # 7) the movers drive back to their pre station positions
-            move_movers(entrance_mover_setposes, pre_station_mover_setposes)
-
-            # 8) the movers drive back to their initial positions
-            move_movers(pre_station_mover_setposes, initial_mover_setposes)
-
+        for seed in itertools.count():
+            env = ReconfigurationEnv(
+                magbot_types=magbot_types,
+                initial_mover_xy_pos=initial_mover_xy_pos,
+                station_poses=station_poses,
+                randomize_magbot_station_pos=randomize_magbot_station_pos,
+                seed=seed,
+            )
+            print(
+                f'scenario {seed}: {env.magbot_type} MagBot in a {type(env.stations[0]).__name__}, MagBot offset along the station x-axis: '
+                f'{env.magbot_station_x_offsets * 1000} mm'
+            )
+            try:
+                run_scenario(env)
+            finally:
+                env.close()
     except KeyboardInterrupt:
         pass
-    finally:
-        env.close()

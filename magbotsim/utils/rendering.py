@@ -2,6 +2,7 @@
 # Copyright (c) 2024 Lara Bergmann, Bielefeld University #
 ##########################################################
 
+import time
 import numpy as np
 import mujoco.viewer
 from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer, BaseRender, OffScreenViewer, WindowViewer
@@ -9,6 +10,31 @@ from mujoco import MjData, MjModel
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 from matplotlib.patches import Rectangle, Circle, Arrow
+
+
+def launch_passive_viewer(model: MjModel, data: MjData, timeout: float = 5.0) -> mujoco.viewer.Handle:
+    """Launch the MuJoCo passive viewer.
+
+    On macOS (``mjpython``), only one passive viewer can be open at a time, and closing a viewer (``Handle.close()``) only requests the
+    viewer to exit, i.e. the viewer is closed asynchronously by the UI thread. If a new viewer is launched directly after closing the
+    previous one (e.g. when reloading the model or creating a new environment after closing the previous one), the UI thread may still
+    be busy and ``mujoco.viewer.launch_passive()`` raises a RuntimeError. In this case, the launch is retried until the previous viewer
+    is closed.
+
+    :param model: mjModel of the MuJoCo environment
+    :param data: mjData of the MuJoCo environment
+    :param timeout: the maximum time to wait for the previous viewer to close [s], defaults to 5.0. If another viewer is still open
+        after this time, the RuntimeError is raised.
+    :return: the handle of the passive viewer
+    """
+    t_end = time.monotonic() + timeout
+    while True:
+        try:
+            return mujoco.viewer.launch_passive(model, data)
+        except RuntimeError as e:
+            if 'already open' not in str(e) or time.monotonic() > t_end:
+                raise
+            time.sleep(0.01)
 
 
 class MujocoWindowViewer(WindowViewer):
@@ -245,7 +271,7 @@ class MujocoViewerCollection(MujocoRenderer):
         else:
             if self.viewer is None:
                 if self.use_mj_passive_viewer:
-                    self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                    self.viewer = launch_passive_viewer(self.model, self.data)
                 else:
                     self.viewer = MujocoWindowViewer(self.model, self.data)
                 self._set_cam_config()
@@ -275,7 +301,7 @@ class MujocoViewerCollection(MujocoRenderer):
                 viewer.data = data
             elif 'human' in viewer_name and self.use_mj_passive_viewer:
                 self._viewers[viewer_name].close()
-                viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                viewer = launch_passive_viewer(self.model, self.data)
                 self._set_cam_config()
                 self._viewers[viewer_name] = viewer
 

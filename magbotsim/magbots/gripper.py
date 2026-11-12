@@ -48,6 +48,8 @@ class GripperMagBotsAPM4330:
         MagBot in stations. If None, the rail mount meshes collide as usual.
     """
 
+    NUM_CONNECTIONS = 3
+
     def __init__(
         self,
         num_magbots: int,
@@ -75,6 +77,8 @@ class GripperMagBotsAPM4330:
         self.gripper_f_joint_names = [f'gripper_jaw_1_hinge_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
 
         self.gripper_pose_site_names = [f'gripper_pose_site_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
+        # slide joints of the MagBot bases (x, y)
+        self.base_xy_joint_names = [(f'gripper_x_{idx_magbot}', f'gripper_y_{idx_magbot}') for idx_magbot in range(0, self.num_magbots)]
 
         # gripper finger pads (used to measure the distance between the two fingers)
         self.gripper_pad_1_geom_names = [f'gripper_pad_1_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
@@ -1200,7 +1204,7 @@ class GripperMagBotsAPM4330:
 
     def gripperSetPose2MoverSetPose(
         self, gripper_pose_d: np.ndarray, z_m: np.ndarray | float, single_track: np.ndarray | bool = False
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> np.ndarray:
         """Calculate the desired mover pose from a desired gripper pose. This method is vectorized and can therefore calculate desired
         mover poses for multiple MagBots.
 
