@@ -127,14 +127,21 @@ class MoverImpedanceController:
         # only the translational damping depends on the (additional) mass
         self.damping[:3, :3] = 2 * np.sqrt(self.stiffness[:3, :3] * mass)
 
-    def set_joint_mask(self, new_joint_mask: np.ndarray):
-        """Set a new joint mask to control only specified DoFs of a mover with this controller.
+    def set_joint_mask(self, new_joint_mask: np.ndarray, data: MjData | None = None):
+        """Set a new joint mask to control only specified DoFs of a mover with this controller. Note that actuators only exist for the DoFs
+        that were controlled when the actuator XML string was generated (see ``generate_actuator_xml_string()``), i.e. the new joint mask
+        must only enable DoFs with an actuator.
 
         :param new_joint_mask: the new joint mask - a numpy array of shape (6,) which contains only 0 and 1 (1 for controlling a DoF).
+        :param data: mjData of the MuJoCo environment, defaults to None. If specified, the controls of the actuators of DoFs that are no
+            longer controlled are set to zero, since ``update()`` only sets the controls of the controlled DoFs. Requires
+            ``update_cached_mujoco_data()``.
         """
-        assert new_joint_mask.shape == (6,)
-        assert (np.bitwise_or(new_joint_mask == 0, new_joint_mask == 1)).all()
-        self.joint_mask = new_joint_mask.astype(np.bool)
+        new_joint_mask = new_joint_mask.astype(np.bool)
+        if data is not None:
+            # the DoFs that were controlled so far have actuators (see above)
+            data.ctrl[self.actuator_ids[self.joint_mask & ~new_joint_mask]] = 0.0
+        self.joint_mask = new_joint_mask
 
     def generate_actuator_xml_string(self, idx_mover: int) -> str:
         """Generate an actuator XML string which can be added to the MuJoCo model XML string. Note that only actuators for DoFs that

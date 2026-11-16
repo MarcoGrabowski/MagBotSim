@@ -1,9 +1,13 @@
+from pathlib import Path
+
 import mujoco
 import numpy as np
 import pytest
 
 from magbotsim import GripperStation, PlatformStation
+from magbotsim.envs_without_rl_api.magbots import reconfiguration_env as reconfiguration_env_module
 from magbotsim.envs_without_rl_api.magbots.reconfiguration_env import ReconfigurationEnv
+from magbotsim.rl_envs.magbots.reconfiguration_rl_env import ReconfigurationRLEnv
 from magbotsim.utils.rotations_utils import vec_quat2euler
 
 # Tests of the station collision proxies (hidden proxies of the rail mounts, rail rods and station pins) of the reconfiguration env:
@@ -45,7 +49,7 @@ def entrance_offsets(env: ReconfigurationEnv) -> np.ndarray:
 @pytest.fixture
 def poses(env: ReconfigurationEnv) -> dict[str, np.ndarray]:
     """Mover set poses (numpy arrays of shape (num_movers, 6)) and MagBot set poses (numpy arrays of shape (1, 7) or (1, 6)) of the
-    station choreography (see the example in reconfiguration_env.py). Connection idx_c is attached to mover idx_c.
+    station choreography (see the example in reconfiguration_env.py). Mover idx_c is docked at connection idx_c.
     """
     station = env.stations[0]
     rot_station = station.rotation_matrix_xy()
@@ -71,6 +75,16 @@ def poses(env: ReconfigurationEnv) -> dict[str, np.ndarray]:
 
 
 COLLISION_KEYS = {'mover_collision', 'wall_collision', 'station_proxy_collision', 'rail_rod_collision', 'station_pin_collision'}
+
+
+def is_parked(env: ReconfigurationEnv) -> bool:
+    """Whether all rail mounts are parked in station 0 and no mover is attached."""
+    return bool((env.connection_station_indices == 0).all() and (env.connection_mover_indices == -1).all())
+
+
+def is_carried(env: ReconfigurationEnv) -> bool:
+    """Whether all rail mounts are carried by movers, rail mount idx_c by mover idx_c (choreography of the tests in this file)."""
+    return bool((env.connection_station_indices == -1).all() and (env.connection_mover_indices[0] == np.arange(env.num_connections)).all())
 
 
 def move_with_info(
@@ -115,7 +129,7 @@ def proxy_contact_names(env: ReconfigurationEnv) -> list[str]:
 
 def test_no_collision_after_reset(env: ReconfigurationEnv) -> None:
     names = [mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_GEOM, idx_geom) for idx_geom in env.geom_ids_proxy]
-    assert sum('_rail_rod' in name for name in names) == env.num_connections
+    assert sum('_rail_rod' in name for name in names) == env.num_movers  # all movers carry a mover adapter
     assert sum('_pins_' in name for name in names) == env.num_connections * 2
     for idx_c in range(env.num_connections):  # each rail mount proxy has jaws (lower layer) and an upper layer
         assert any(f'rail_mount_{idx_c}_0_proxy_lower_' in name for name in names)
@@ -126,7 +140,7 @@ def test_no_collision_after_reset(env: ReconfigurationEnv) -> None:
 def test_empty_movers_diagonal_entry_collides(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> None:
     # the empty movers drive in front of the station (the MagBot is parked in the station)
     assert not move(env, poses['initial'], poses['pre_station'], duration=1.5)
-    assert (env.mover_station_indices == 0).all()
+    assert is_parked(env)
     # the empty movers enter the station diagonally instead of along the entry axis -> the rail rods hit the jaws of the rail mounts
     info = move_with_info(env, poses['pre_station'], poses['station'], duration=1.5)
     assert info['station_proxy_collision'] and info['rail_rod_collision'] and not info['station_pin_collision']
@@ -140,7 +154,7 @@ def test_magbot_diagonal_entry_collides(env: ReconfigurationEnv, poses: dict[str
     assert not move(env, poses['pre_station'], poses['entrance'], duration=1.5)
     assert not move(env, poses['entrance'], poses['station'], duration=1.5)
     assert not move(env, poses['magbot_station'], poses['magbot_center'], duration=1.5, magbot=True)
-    assert (env.mover_station_indices == -1).all()
+    assert is_carried(env)
     # the MagBot is shifted sideways (away from the station)
     assert not move(env, poses['magbot_center'], poses['magbot_shifted'], duration=1.0, magbot=True)
     # the MagBot is moved back into the station diagonally -> the rail mounts hit the station pins
@@ -260,9 +274,9 @@ def test_shifted_magbot_pickup_and_putback(env: ReconfigurationEnv, poses: dict[
     assert not move(env, poses['initial'], pickup['pre_station'], duration=1.5)
     assert not move(env, pickup['pre_station'], pickup['entrance'], duration=1.5)
     assert not move(env, pickup['entrance'], pickup['station'], duration=1.5)
-    assert (env.mover_station_indices == 0).all()
+    assert is_parked(env)
     assert not move(env, pickup['magbot_station'], poses['magbot_center'], duration=1.5, magbot=True)
-    assert (env.mover_station_indices == -1).all()
+    assert is_carried(env)
     # the rail mounts were picked up without a jump, i.e. they stay on the mover adapters
     mover_xy = env.get_mover_qpos(mover_names=env.mover_names)[:, :2]
     assert np.linalg.norm(env.get_rail_mount_xy() - mover_xy, axis=1).max() < 0.0005
@@ -270,7 +284,7 @@ def test_shifted_magbot_pickup_and_putback(env: ReconfigurationEnv, poses: dict[
     # the MagBot is put back at the nominal station pose and stays there (no re-randomization)
     assert not move(env, poses['magbot_center'], poses['magbot_station'], duration=1.5, magbot=True)
     assert not move(env, poses['station'], poses['entrance'], duration=1.5)
-    assert (env.mover_station_indices == 0).all()
+    assert is_parked(env)
     assert np.linalg.norm(env.get_rail_mount_xy() - poses['station'][:, :2], axis=1).max() < 0.0005
 
 
@@ -280,7 +294,7 @@ def test_putback_off_nominal_does_not_switch(env: ReconfigurationEnv, poses: dic
     assert not move(env, poses['pre_station'], poses['entrance'], duration=1.5)
     assert not move(env, poses['entrance'], poses['station'], duration=1.5)
     assert not move(env, poses['magbot_station'], poses['magbot_center'], duration=1.5, magbot=True)
-    assert (env.mover_station_indices == -1).all()
+    assert is_carried(env)
     # the MagBot is put back 3 mm (> station_switch_tol) in front of the nominal station pose
     rot_station = env.stations[0].rotation_matrix_xy()
     magbot_off = poses['magbot_station'].copy()
@@ -290,7 +304,7 @@ def test_putback_off_nominal_does_not_switch(env: ReconfigurationEnv, poses: dic
     assert not move(env, poses['magbot_center'], magbot_off, duration=1.5, magbot=True)
     # the movers try to leave along the entry axis -> the rail mounts are not welded to the station
     move(env, station_off, station_off + (poses['entrance'] - poses['station']), duration=0.5, hold=0.0)
-    assert (env.mover_station_indices == -1).all()
+    assert is_carried(env)
 
 
 # Tests of the parked MagBot, the MagBot kinematics helpers and the selection of the MagBot type.
@@ -362,3 +376,24 @@ def test_invalid_initial_mover_xy_pos() -> None:
             station_poses=STATION_POSES,
             render_mode=None,
         )
+
+
+# Tests of the model XML that is saved next to the Python script of the environment at initialization.
+
+
+def test_model_xml_saved_next_to_script(env: ReconfigurationEnv) -> None:
+    path = env.model_xml_path
+    assert path.parent == Path(reconfiguration_env_module.__file__).resolve().parent
+    assert path.name == f'reconfiguration_env_{env.magbot_type}.xml'
+    assert path.read_text() == env.model_xml_str
+    # the saved file is a standalone model (absolute asset paths) and equals the model of the environment
+    model = mujoco.MjModel.from_xml_path(str(path))
+    assert (model.nbody, model.njnt, model.neq, model.nu) == (env.model.nbody, env.model.njnt, env.model.neq, env.model.nu)
+
+
+def test_model_xml_of_rl_env_saved_next_to_env_script() -> None:
+    env = ReconfigurationRLEnv(magbot_types=('sixD_platform',), station_poses=STATION_POSES, render_mode=None)
+    env_script = Path(reconfiguration_env_module.__file__).resolve()
+    assert env.model_xml_path == env_script.with_name('reconfiguration_env_sixD_platform.xml')
+    assert env.model_xml_path.read_text() == env.model_xml_str
+    env.close()

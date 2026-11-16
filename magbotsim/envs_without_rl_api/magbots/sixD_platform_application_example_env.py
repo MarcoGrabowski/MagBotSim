@@ -86,7 +86,10 @@ class SixDPlatformMagBotApplicationExampleEnv(BasicMagBotEnv):
             mover_qpos = self.get_mover_qpos(mover_names=self.mover_names, add_noise=False)
             # generate custom model XML strings for the MagBot
             self.magbot = SixDPlatformMagBotsAPM4330(
-                num_magbots=self.num_magbots, indices_mover_a=self.indices_mover_a, indices_mover_b=self.indices_mover_b
+                num_magbots=self.num_magbots,
+                num_movers=self.num_movers,
+                indices_mover_a=self.indices_mover_a,
+                indices_mover_b=self.indices_mover_b,
             )
             custom_model_xml_strings = self.magbot.generate_magbot_xml_strings(
                 initial_pos_xyz_mover_b=mover_qpos[self.indices_mover_b, :3], custom_model_xml_strings=custom_model_xml_strings

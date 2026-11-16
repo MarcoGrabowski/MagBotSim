@@ -6,6 +6,7 @@ from scipy.interpolate import CubicSpline
 from magbotsim.utils import rotations_utils, mujoco_utils
 from magbotsim.utils.rotations_utils import ContinuousYawExtractor
 from magbotsim.stations.station_collision_proxies import StationCollisionProxies
+from magbotsim.magbots.mover_coupling import NO_INDEX, MagBotMoverCoupling, wrap_angle
 
 
 @dataclass(frozen=True)
@@ -34,42 +35,65 @@ class GripperMagBotsAPM4330Params:
     f_d_max: float = 0.017
 
 
-class GripperMagBotsAPM4330:
+class GripperMagBotsAPM4330(MagBotMoverCoupling):
     """Base class for Gripper MagBots. This class can handle multiple Gripper MagBots, allowing calculations to be vectorized.
 
+    The movers are coupled with the connections (rail mounts) of the MagBots as described in ``MagBotMoverCoupling``. Either the movers
+    attached to the connections are specified (static mode: ``indices_mover_c0``, ``indices_mover_c1`` and ``indices_mover_c2``) or not
+    (dynamic mode), in which case the movers are attached to and detached from the connections at runtime (``attach_mover()``,
+    ``detach_mover()``). The c-rotations of the attached movers are coupled with the gripper rotations and the finger
+    opening (see ``control_gripper()``). The MagBot does not control the c-rotations of the movers that are not attached.
+
     :param num_magbots: number of Gripper MagBots
-    :param indices_mover_c0: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 0
-    :param indices_mover_c1: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 1
-    :param indices_mover_c2: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 2
-    :param magbot_params: an instance of GripperMagBotsAPM4330Params
-    :param cycle_time: the cycle time used in the BasicMagBotEnv (usually 1ms)
+    :param num_movers: the number of movers in the environment
+    :param indices_mover_c0: static mode: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 0,
+        defaults to None
+    :param indices_mover_c1: static mode: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 1,
+        defaults to None
+    :param indices_mover_c2: static mode: a numpy array of shape (num_magbots,) containing all indices of movers attached to connection 2,
+        defaults to None
+    :param magbot_params: an instance of GripperMagBotsAPM4330Params, defaults to None (default parameters)
+    :param cycle_time: the cycle time used in the BasicMagBotEnv (usually 1ms), defaults to 0.001
     :param station_proxies: the hidden collision proxies for the station switch, defaults to None. If specified, the rail mount
         meshes are visual-only and each rail mount gets a collision proxy (see ``StationCollisionProxies``), which is required to park the
         MagBot in stations. If None, the rail mount meshes collide as usual.
     """
 
     NUM_CONNECTIONS = 3
+    # yaw conventions in connection order (see MagBotMoverCoupling): kinematic connection yaw - rail mount yaw (rail_mount_1 is rotated
+    # by pi), the yaws of the rail mount sites, and the connections that are entered from the side of the flipped adapter (connection 0)
+    RAIL_MOUNT_YAW_OFFSETS = np.array([0.0, np.pi, 0.0])
+    RAIL_MOUNT_SITE_YAWS = np.array([np.pi, np.pi, 0.0])
+    FLIPPED_ADAPTER_CONNECTIONS = np.array([True, False, False])
+    # yaw offsets (mover yaw - kinematic connection yaw) of movers with the standard adapter (dynamic mode), i.e. a mover attached to
+    # connection 0 is rotated by pi
+    MOVER_YAW_OFFSETS = np.array([np.pi, 0.0, 0.0])
+    MOVER_EXCLUDE_BODIES = ('mover_{idx_mover}', 'm_{idx_mover}_rail')
 
     def __init__(
         self,
         num_magbots: int,
-        indices_mover_c0: np.ndarray,
-        indices_mover_c1: np.ndarray,
-        indices_mover_c2: np.ndarray,
-        magbot_params: GripperMagBotsAPM4330Params,
-        cycle_time: float,
+        num_movers: int,
+        indices_mover_c0: np.ndarray | None = None,
+        indices_mover_c1: np.ndarray | None = None,
+        indices_mover_c2: np.ndarray | None = None,
+        magbot_params: GripperMagBotsAPM4330Params | None = None,
+        cycle_time: float = 0.001,
         station_proxies: StationCollisionProxies | None = None,
     ) -> None:
         self.num_magbots = num_magbots
         self.station_proxies = station_proxies
         self.magbots = []
-        self.magbot_params = magbot_params
+        self.magbot_params = GripperMagBotsAPM4330Params() if magbot_params is None else magbot_params
 
-        # mover indices
-        self.mover_indices = np.concatenate((indices_mover_c0[:, None], indices_mover_c1[:, None], indices_mover_c2[:, None]), axis=1)
-        self.indices_mover_c0 = indices_mover_c0
-        self.indices_mover_c1 = indices_mover_c1
-        self.indices_mover_c2 = indices_mover_c2
+        # mover coupling (static or dynamic mode)
+        indices_mover = [indices_mover_c0, indices_mover_c1, indices_mover_c2]
+        assert all(indices is None for indices in indices_mover) or all(indices is not None for indices in indices_mover), (
+            'specify the movers of all connections or of none (dynamic mode)'
+        )
+        connection_mover_indices = None if indices_mover_c0 is None else np.stack(indices_mover, axis=1)
+        self._init_mover_coupling(num_magbots=num_magbots, num_movers=num_movers, connection_mover_indices=connection_mover_indices)
+        assert np.allclose(self.mover_yaw_offsets(), self.MOVER_YAW_OFFSETS)
 
         # gripper qpos
         self.gripper_a_joint_names = [f'gripper_alpha_joint_{idx_magbot}' for idx_magbot in range(0, self.num_magbots)]
@@ -97,10 +121,10 @@ class GripperMagBotsAPM4330:
 
         # couple mover rotation to gripper rotations
         self.cycle_time = cycle_time
-        self.mover_yaw_estimator = None
         self.Kp = 3.0
         self.Ki = 0.1
         self.Kd = 0.6
+        self.reset_yaw_extractor()
 
     def _update_cached_gripper_site_ids(self, model: MjModel) -> None:
         """Update gripper site ids.
@@ -247,10 +271,10 @@ class GripperMagBotsAPM4330:
 
         :param model: mjModel of the MuJoCo environment
         """
-        # mover actuators
-        self.mover_actuator_ids = np.zeros((self.num_magbots * 3,), dtype=np.int32)
-        for idx_mover in range(0, self.num_magbots * 3):
-            self.mover_actuator_ids[idx_mover] = model.actuator(self.mover_actuator_names[idx_mover]).id
+        # mover c-rotation actuators, [idx_mover]: actuator of mover idx_mover (NO_INDEX: mover without adapter, see adapter_mover_indices)
+        self.mover_actuator_ids = np.full((self.num_movers,), NO_INDEX, dtype=np.int32)
+        for idx_mover, actuator_name in zip(self.adapter_mover_indices, self.mover_actuator_names, strict=True):
+            self.mover_actuator_ids[idx_mover] = model.actuator(actuator_name).id
 
         # gripper actuators
         self.gripper_abf_actuator_ids = np.zeros((self.num_magbots, 3), dtype=np.int32)
@@ -259,12 +283,34 @@ class GripperMagBotsAPM4330:
                 self.gripper_abf_actuator_ids[idx_magbot, idx_a] = model.actuator(actuator_name).id
 
     def reset_yaw_extractor(self) -> None:
-        """Reset the continuous mover yaw extractor, i.e. set all integrated valued to zero."""
-        self.mover_yaw_extractor = ContinuousYawExtractor(num_samples=self.num_magbots * 3)
+        """Reset the state of the coupling between the mover rotations and the gripper (continuous mover yaws, kinematic connection
+        yaws, integrated errors). The state is initialized again in the next call of ``control_gripper()``.
+        """
+        self.mover_yaw_extractor = ContinuousYawExtractor(num_samples=self.num_movers)
         # the gripper c-rotation is derived from an arctan2 and therefore has to be unwrapped, otherwise the gripper
         # b-rotation and finger angle, which are both derived from c, jump by 2*pi whenever c crosses +/-pi
         self.gripper_c_unwrapper = ContinuousYawExtractor(num_samples=self.num_magbots)
-        self.error_integrated = np.zeros((self.num_magbots * 3,))
+        # continuous kinematic connection yaws (initialized in control_gripper()), [idx_magbot, idx_c]
+        self.connection_yaws: np.ndarray | None = None
+        # multiples of 2*pi that align the continuous mover yaw (measured) and the mover set yaw (desired) of an attached mover with the
+        # kinematic connection yaw (determined when a mover is attached at runtime)
+        self.connection_yaw_branches_measured = np.zeros((self.num_magbots, self.NUM_CONNECTIONS))
+        self.connection_yaw_branches_desired = np.zeros((self.num_magbots, self.NUM_CONNECTIONS))
+        self._connection_newly_attached = np.zeros((self.num_magbots, self.NUM_CONNECTIONS), dtype=bool)
+        self.error_integrated = np.zeros((self.num_magbots, self.NUM_CONNECTIONS))
+
+    def _on_mover_attached(self, idx_magbot: int, idx_c: int) -> None:
+        """Reset the controller state of a connection to which a mover was attached at runtime (see ``control_gripper()``).
+
+        :param idx_magbot: the index of the MagBot
+        :param idx_c: the index of the connection
+        """
+        self._connection_newly_attached[idx_magbot, idx_c] = True
+        self.error_integrated[idx_magbot, idx_c] = 0.0
+
+    def _on_mover_coupling_reset(self) -> None:
+        """Reset the state of the coupling between the mover rotations and the gripper after the attachments are reset."""
+        self.reset_yaw_extractor()
 
     def update_cached_mujoco_data(self, model: MjModel) -> None:
         """Update all cached information about MuJoCo objects, such as names and IDs.
@@ -273,6 +319,8 @@ class GripperMagBotsAPM4330:
         """
         # actuator IDs
         self._update_cached_actuator_ids(model)
+        # rail mount body and mover weld IDs
+        self._update_cached_coupling_ids(model)
         # gripper
         self._update_cached_gripper_qpos_indices(model)
         # gripper site IDs
@@ -289,59 +337,122 @@ class GripperMagBotsAPM4330:
         # update yaw estimator
         self.reset_yaw_extractor()
 
+    def _compute_gripper_abcf(
+        self, xy_c0: np.ndarray, xy_c1: np.ndarray, connection_yaws: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Calculate the gripper rotations and the finger (jaw) angle from the positions of connections 0 and 1 and the (continuous)
+        kinematic connection yaws. This method is vectorized and updates the unwrapped gripper c-rotation.
+
+        :param xy_c0: the (x,y) positions of connection 0. Shape: (num_magbots,2)
+        :param xy_c1: the (x,y) positions of connection 1. Shape: (num_magbots,2)
+        :param connection_yaws: the continuous kinematic connection yaws. Shape: (num_magbots,3)
+        :return: the gripper a-, b- and c-rotations and the finger angle, i.e. four numpy arrays of shape (num_magbots,)
+        """
+        p = self.magbot_params
+        # platform xy-pos
+        xy_p = 0.5 * (xy_c0 + xy_c1)
+        # gripper rotations
+        a = -0.5 * (np.divide(connection_yaws[:, 0], p.s_m0) - np.divide(connection_yaws[:, 1], p.s_m1))
+        c = self.gripper_c_unwrapper.update_from_angle(np.arctan2(xy_c1[:, 1] - xy_p[:, 1], xy_c1[:, 0] - xy_p[:, 0]))
+        b = a - np.divide(connection_yaws[:, 1] - c, p.s_m1)
+        # gripper finger
+        f = np.divide(connection_yaws[:, 2] - a - c, p.s_m2)
+        return a, b, c, f
+
+    def _init_connection_yaws(self, data: MjData, mover_yaws: np.ndarray, xy_connections: np.ndarray) -> None:
+        """Initialize the continuous kinematic connection yaws. The yaws of attached connections are given by the continuous yaws of the
+        attached movers. The yaws of connections without a mover are given by the rail mount yaws and are chosen within +/-pi of the
+        gripper c-rotation, i.e. a MagBot in its default configuration has the gripper rotations a=b=0 and the finger angle 0.
+
+        :param data: mjData of the MuJoCo environment
+        :param mover_yaws: the continuous mover yaws. Shape: (num_movers,)
+        :param xy_connections: the (x,y) positions of the connections. Shape: (num_magbots,3,2)
+        """
+        xy_c0, xy_c1 = xy_connections[:, 0], xy_connections[:, 1]
+        xy_p = 0.5 * (xy_c0 + xy_c1)
+        c = np.arctan2(xy_c1[:, 1] - xy_p[:, 1], xy_c1[:, 0] - xy_p[:, 0])
+        rail_mount_yaws = self.get_rail_mount_yaws(data) + self.RAIL_MOUNT_YAW_OFFSETS[np.newaxis, :]
+        self.connection_yaws = c[:, np.newaxis] + wrap_angle(rail_mount_yaws - c[:, np.newaxis])
+        indices_magbot, indices_c, indices_mover = self.get_carried_connections()
+        self.connection_yaws[indices_magbot, indices_c] = mover_yaws[indices_mover] - self.pair_yaw_offsets[indices_mover, indices_c]
+        self.connection_yaw_branches_measured[:] = 0.0
+        self.connection_yaw_branches_desired[:] = 0.0
+        self._connection_newly_attached[:] = False
+
     def control_gripper(
         self, model: MjModel, data: MjData, mover_poses_d: np.ndarray, current_mover_qpos: np.ndarray, current_mover_qvels: np.ndarray
     ) -> None:
-        """Couple the rotations around the z-axes of the movers with the grippers's a and b rotations, and the opening of the fingers.
-        This method is vectorized and can therefore couple the rotations for multiple MagBots.
+        """Couple the rotations around the z-axes of the attached movers with the grippers's a and b rotations, and the opening of the
+        fingers. This method is vectorized and can therefore couple the rotations for multiple MagBots.
+
+        The gripper rotations and the finger angle are derived from the kinematic connection yaws, i.e. the continuous yaws of the attached
+        movers (minus the yaw offset of the mover, see ``MagBotMoverCoupling``). The kinematic yaw of a connection without a mover (e.g.
+        a rail mount parked in a station) is held, i.e. a parked gripper does not move. The c-rotations of the attached movers are
+        controlled by a PID controller, whereas the c-rotation actuators of all other movers are set to zero.
+
+        If a mover is attached at runtime (``attach_mover()``), its continuous yaw and its set yaw are aligned with the kinematic
+        connection yaw by multiples of 2*pi, i.e. the mover set yaw can be specified as wrapped angle until the mover is attached, but must
+        be continuous afterwards (e.g. as returned by ``gripperSetPose2MoverSetPose``).
 
         :param model: mjModel of the MuJoCo environment
         :param data: mjData of the MuJoCo environment
-        :param mover_poses_d: the desired mover poses (rotation specified as Euler angles (xyz) in rad). Shape: (num_magbots*3,6)
-        :param current_mover_qpos: the current qpos of all movers (rotation specified as quaternion [w,x,y,z]). Shape: (num_magbots*3,7)
-        :param current_mover_qvels: the current qvel of all movers. Shape: (num_magbots*3,6)
+        :param mover_poses_d: the desired mover poses (rotation specified as Euler angles (xyz) in rad), [idx_mover,:]: pose of mover
+            idx_mover. Only the poses of the attached movers are used. Shape: (num_movers,6)
+        :param current_mover_qpos: the current qpos of all movers (rotation specified as quaternion [w,x,y,z]). Shape: (num_movers,7)
+        :param current_mover_qvels: the current qvel of all movers. Shape: (num_movers,6)
         """
         if not hasattr(self, 'gripper_abf_actuator_ids'):
             self._update_cached_actuator_ids(model)
         if len(mover_poses_d.shape) > 2:
             mover_poses_d = mover_poses_d.reshape((-1, 6))
 
-        quats = current_mover_qpos[:, 3:7]
-        mover_yaws = self.mover_yaw_extractor.update(quats)
+        mover_yaws = self.mover_yaw_extractor.update(current_mover_qpos[:, 3:7])
 
-        xyc_c0_movers = np.zeros((self.num_magbots, 3))
-        xyc_c1_movers = np.zeros((self.num_magbots, 3))
-        xyc_c2_movers = np.zeros((self.num_magbots, 3))
+        # connections carried by movers and the attached movers
+        indices_magbot, indices_c, indices_mover = self.get_carried_connections()
+        yaw_offsets = self.pair_yaw_offsets[indices_mover, indices_c]
 
-        xyc_c0_movers[:, :2] = current_mover_qpos[self.indices_mover_c0, :2]
-        xyc_c1_movers[:, :2] = current_mover_qpos[self.indices_mover_c1, :2]
-        xyc_c2_movers[:, :2] = current_mover_qpos[self.indices_mover_c2, :2]
+        # positions of the connections: attached movers or rail mounts (e.g. parked in a station)
+        xy_connections = data.xpos[self.rail_mount_body_ids, :2].copy()
+        xy_connections[indices_magbot, indices_c] = current_mover_qpos[indices_mover, :2]
 
-        xyc_c0_movers[:, 2] = mover_yaws[self.indices_mover_c0]
-        xyc_c1_movers[:, 2] = mover_yaws[self.indices_mover_c1]
-        xyc_c2_movers[:, 2] = mover_yaws[self.indices_mover_c2]
+        # kinematic connection yaws
+        if self.connection_yaws is None:
+            self._init_connection_yaws(data=data, mover_yaws=mover_yaws, xy_connections=xy_connections)
+        assert self.connection_yaws is not None
+        if self._connection_newly_attached.any():
+            for idx_magbot, idx_c in zip(*np.nonzero(self._connection_newly_attached), strict=True):
+                if not self.connections_carried[idx_magbot, idx_c]:  # detached again before this control cycle
+                    continue
+                idx_mover = self.connection_mover_indices[idx_magbot, idx_c]
+                yaw_offset = self.pair_yaw_offsets[idx_mover, idx_c]
+                held_yaw = self.connection_yaws[idx_magbot, idx_c]
+                measured = mover_yaws[idx_mover] - yaw_offset
+                desired = mover_poses_d[idx_mover, 5] - yaw_offset
+                self.connection_yaw_branches_measured[idx_magbot, idx_c] = 2 * np.pi * np.round((held_yaw - measured) / (2 * np.pi))
+                self.connection_yaw_branches_desired[idx_magbot, idx_c] = 2 * np.pi * np.round((held_yaw - desired) / (2 * np.pi))
+            self._connection_newly_attached[:] = False
+        self.connection_yaws[indices_magbot, indices_c] = (
+            mover_yaws[indices_mover] - yaw_offsets + self.connection_yaw_branches_measured[indices_magbot, indices_c]
+        )
 
-        # platform xyz-pos
-        x_p = np.divide((xyc_c0_movers[:, 0] + xyc_c1_movers[:, 0]), 2)
-        y_p = np.divide((xyc_c0_movers[:, 1] + xyc_c1_movers[:, 1]), 2)
-
-        # gripper rotations
-        a = -0.5 * (np.divide(xyc_c0_movers[:, 2], self.magbot_params.s_m0) - np.divide(xyc_c1_movers[:, 2], self.magbot_params.s_m1))
-        c = self.gripper_c_unwrapper.update_from_angle(np.arctan2(xyc_c1_movers[:, 1] - y_p, xyc_c1_movers[:, 0] - x_p))
-        b = a - np.divide(xyc_c1_movers[:, 2] - c, self.magbot_params.s_m1)
-
-        # gripper finger
-        f = np.divide(xyc_c2_movers[:, 2] - a - c, self.magbot_params.s_m2)
-
+        # gripper rotations and finger
+        a, b, _, f = self._compute_gripper_abcf(
+            xy_c0=xy_connections[:, 0], xy_c1=xy_connections[:, 1], connection_yaws=self.connection_yaws
+        )
         data.ctrl[self.gripper_abf_actuator_ids[:, 0]] = a
         data.ctrl[self.gripper_abf_actuator_ids[:, 1]] = b
         data.ctrl[self.gripper_abf_actuator_ids[:, 2]] = f
 
-        # set mover c pose
-        yaw_error = mover_poses_d[:, -1] - mover_yaws
-        self.error_integrated += yaw_error * self.cycle_time
-        integral_term = np.clip(self.Ki * self.error_integrated, -1.0, 1.0)
-        data.ctrl[self.mover_actuator_ids] = self.Kp * yaw_error + integral_term - self.Kd * current_mover_qvels[:, 5]
+        # set mover c pose (attached movers), the c-rotations of all other movers are not controlled by the MagBot
+        connection_yaws_d = mover_poses_d[indices_mover, 5] - yaw_offsets + self.connection_yaw_branches_desired[indices_magbot, indices_c]
+        yaw_error = connection_yaws_d - self.connection_yaws[indices_magbot, indices_c]
+        self.error_integrated[indices_magbot, indices_c] += yaw_error * self.cycle_time
+        integral_term = np.clip(self.Ki * self.error_integrated[indices_magbot, indices_c], -1.0, 1.0)
+        data.ctrl[self.mover_actuator_ids[self.adapter_mover_indices]] = 0.0
+        data.ctrl[self.mover_actuator_ids[indices_mover]] = (
+            self.Kp * yaw_error + integral_term - self.Kd * current_mover_qvels[indices_mover, 5]
+        )
 
     def generate_magbot_xml_strings(
         self, initial_pos_xyz_mover_c0: np.ndarray, custom_model_xml_strings: dict | None, initial_yaw: np.ndarray | None = None
@@ -362,15 +473,11 @@ class GripperMagBotsAPM4330:
         if custom_model_xml_strings is None:
             custom_model_xml_strings = {}
 
-        # rail mount and mover adapter meshes are visual-only if the station collision proxies are used
+        # rail mount meshes are visual-only if the station collision proxies are used
         rail_mount_contact_attr = ' contype="0" conaffinity="0"' if self.station_proxies is not None else ''
-        adapter_contact_attr = rail_mount_contact_attr
 
-        def rail_rod(idx_mover: int) -> str:
-            """Return the XML string of the rail rod of a mover adapter (empty if no station collision proxies are used)."""
-            if self.station_proxies is None:
-                return ''
-            return '\n' + self.station_proxies.rail_rod_xml_str(body_name=f'm_{idx_mover}_rail_rod')
+        # mover adapters of all movers that can carry a rail mount
+        self._add_mover_adapters_xml(custom_model_xml_strings)
 
         def rail_mount_proxy(idx_c: int, idx_magbot: int) -> str:
             """Return the XML string of the rail mount collision proxy (empty if no station collision proxies are used)."""
@@ -470,69 +577,6 @@ class GripperMagBotsAPM4330:
                     custom_assets_xml_str = gripper_assets_xml_str
                 custom_model_xml_strings['custom_assets_xml_str'] = custom_assets_xml_str
 
-            # mover body XML strings
-            mover_body_xml_strs = custom_model_xml_strings.get('custom_mover_body_xml_str_list')
-            assert isinstance(mover_body_xml_strs, list), 'custom_mover_body_xml_str_list must be a list'
-            # mover connection 0
-            mover_body_c0_list = [
-                f'\t\t\t<site name="site_m_{self.indices_mover_c0[idx_magbot]}" pos="0 0 0"/>',
-                f'\n\t\t\t<body name="m_{self.indices_mover_c0[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 -1.5708">',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                f'pos="0 0 0" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<site name="m_{self.indices_mover_c0[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 1.5708" size="0.001" '
-                'type="sphere"/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" '
-                f'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" '
-                f'euler="0 0 1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c0[idx_magbot]}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" '
-                f'material="black"{adapter_contact_attr}/>'
-                + rail_rod(self.indices_mover_c0[idx_magbot]),
-                '\t\t\t</body>',
-            ]
-            mover_body_c0_xml_str = '\n'.join(mover_body_c0_list)
-            mover_body_xml_strs[self.indices_mover_c0[idx_magbot]] = mover_body_c0_xml_str
-            # mover connection 1
-            mover_body_c1_list = [
-                f'\t\t\t<site name="site_m_{self.indices_mover_c1[idx_magbot]}" pos="0 0 0"/>',
-                f'\n\t\t\t<body name="m_{self.indices_mover_c1[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 1.5708">',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                f'pos="0 0 0" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<site name="m_{self.indices_mover_c1[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 1.5708" size="0.001" '
-                'type="sphere"/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" '
-                f'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" euler="0 0 1.5708"'
-                f' mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c1[idx_magbot]}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" '
-                f'material="black"{adapter_contact_attr}/>'
-                + rail_rod(self.indices_mover_c1[idx_magbot]),
-                '\t\t\t</body>',
-            ]
-            mover_body_c1_xml_str = '\n'.join(mover_body_c1_list)
-            mover_body_xml_strs[self.indices_mover_c1[idx_magbot]] = mover_body_c1_xml_str
-            custom_model_xml_strings['custom_mover_body_xml_str_list'] = mover_body_xml_strs
-            # mover connection 2
-            mover_body_c2_list = [
-                f'\t\t\t<site name="site_m_{self.indices_mover_c2[idx_magbot]}" pos="0 0 0"/>',
-                f'\n\t\t\t<body name="m_{self.indices_mover_c2[idx_magbot]}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 1.5708">',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" '
-                f'pos="0 0 0" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<site name="m_{self.indices_mover_c2[idx_magbot]}_rail_site" pos="0 0 0" euler="0 0 -1.5708" size="0.001" '
-                'type="sphere"/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" '
-                f'euler="0 0 -1.5708" mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" euler="0 0 1.5708"'
-                f' mesh="spring_loaded_pin" material="black"{adapter_contact_attr}/>',
-                f'\t\t\t\t<geom name="m_{self.indices_mover_c2[idx_magbot]}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" '
-                f'material="black"{adapter_contact_attr}/>'
-                + rail_rod(self.indices_mover_c2[idx_magbot]),
-                '\t\t\t</body>',
-            ]
-            mover_body_c2_xml_str = '\n'.join(mover_body_c2_list)
-            mover_body_xml_strs[self.indices_mover_c2[idx_magbot]] = mover_body_c2_xml_str
-            custom_model_xml_strings['custom_mover_body_xml_str_list'] = mover_body_xml_strs
-
             # gripper magbot
             gripper_magbot_list = [
                 f'\n\t\t<!-- Gripper MagBot {idx_magbot} -->',
@@ -549,8 +593,7 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t\t<joint name="rail_mount_0_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_0_{idx_magbot}" type="mesh" mesh="rail_mount_m0_mesh" mass="0.5" pos="0 0 0" '
                 f'material="black"{rail_mount_contact_attr}/>',
-                f'\t\t\t\t<site name="rail_mount_0_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
-                + rail_mount_proxy(0, idx_magbot),
+                '\t\t\t\t' + self._rail_mount_site_xml_str(idx_c=0, idx_magbot=idx_magbot) + rail_mount_proxy(0, idx_magbot),
                 f'\t\t\t\t<body name="rotation_plate_m0_{idx_magbot}" pos="0 0 0.0285" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_m0_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0"/>',
                 f'\t\t\t\t\t<geom name="rotation_plate_m0_geom_{idx_magbot}" type="mesh" pos="0 0 0" mass="0.01" mesh="rotation_plate_m0" '
@@ -887,8 +930,7 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t\t<joint name="rail_mount_1_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_1_{idx_magbot}" type="mesh" euler="0 0 -1.5707963" mesh="rail_mount_m1m2_mesh" '
                 f'mass="0.5" pos="0 0 0" material="black"{rail_mount_contact_attr}/>',
-                f'\t\t\t\t<site name="rail_mount_1_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
-                + rail_mount_proxy(1, idx_magbot),
+                '\t\t\t\t' + self._rail_mount_site_xml_str(idx_c=1, idx_magbot=idx_magbot) + rail_mount_proxy(1, idx_magbot),
                 f'\t\t\t\t<body name="rotation_plate_m1_{idx_magbot}" pos="0 0 0.0285" euler="0 0 3.14159" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_m1_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0"/>',
                 f'\t\t\t\t\t<geom name="rotation_plate_m1_geom_{idx_magbot}" type="mesh" pos="0 0 0" mass="0.01" mesh="rotation_plate_m1" '
@@ -934,8 +976,7 @@ class GripperMagBotsAPM4330:
                 f'\t\t\t\t<joint name="rail_mount_2_joint_yaw_{idx_magbot}" type="hinge" axis="0 0 1"/>',
                 f'\t\t\t\t<geom name="rail_mount_geom_2_{idx_magbot}" type="mesh" mesh="rail_mount_m1m2_mesh" euler="0 0 1.5707963" '
                 f'mass="0.5" pos="0 0 0" material="black"{rail_mount_contact_attr}/>',
-                f'\t\t\t\t<site name="rail_mount_2_site_{idx_magbot}" pos="0 0 0" size="0.001" type="sphere"/>'
-                + rail_mount_proxy(2, idx_magbot),
+                '\t\t\t\t' + self._rail_mount_site_xml_str(idx_c=2, idx_magbot=idx_magbot) + rail_mount_proxy(2, idx_magbot),
                 f'\t\t\t\t<body name="rotation_plate_m2_{idx_magbot}" pos="0 0 0.0285" gravcomp="1">',
                 f'\t\t\t\t\t<joint name="rotation_plate_m2_joint_{idx_magbot}" type="hinge" axis="0 0 1" pos="0 0 0" damping="0"/>',
                 f'\t\t\t\t\t<geom name="rotation_plate_m2_geom_{idx_magbot}" type="mesh" pos="0 0 0" mass="0.01" mesh="rotation_plate_m2" '
@@ -991,14 +1032,10 @@ class GripperMagBotsAPM4330:
             # contacts
             gripper_contact_list = [
                 f'\n\t\t<!-- Gripper MagBot {idx_magbot} -->',
-                f'\t\t<exclude body1="rail_mount_0_{idx_magbot}" body2="mover_{self.indices_mover_c0[idx_magbot]}"/>',
-                f'\t\t<exclude body1="rail_mount_0_{idx_magbot}" body2="m_{self.indices_mover_c0[idx_magbot]}_rail"/>',
+                # rail mounts and the mover adapters of all movers that can carry them
+                *self._mover_exclude_xml_lines(idx_magbot=idx_magbot),
                 f'\t\t<exclude body1="rail_mount_0_{idx_magbot}" body2="k0_connection_{idx_magbot}"/>',
-                f'\t\t<exclude body1="rail_mount_1_{idx_magbot}" body2="mover_{self.indices_mover_c1[idx_magbot]}"/>',
-                f'\t\t<exclude body1="rail_mount_1_{idx_magbot}" body2="m_{self.indices_mover_c1[idx_magbot]}_rail"/>',
                 f'\t\t<exclude body1="rail_mount_1_{idx_magbot}" body2="k1_connection_{idx_magbot}"/>',
-                f'\t\t<exclude body1="rail_mount_2_{idx_magbot}" body2="mover_{self.indices_mover_c2[idx_magbot]}"/>',
-                f'\t\t<exclude body1="rail_mount_2_{idx_magbot}" body2="m_{self.indices_mover_c2[idx_magbot]}_rail"/>',
                 f'\t\t<exclude body1="rail_mount_2_{idx_magbot}" body2="k2_connection_{idx_magbot}"/>',
                 f'\t\t<exclude body1="platform_{idx_magbot}" body2="k1_connection_{idx_magbot}"/>',
                 f'\t\t<exclude body1="platform_{idx_magbot}" body2="k2_connection_{idx_magbot}"/>',
@@ -1023,12 +1060,8 @@ class GripperMagBotsAPM4330:
             # equality constraints
             gripper_equality_list = [
                 '\n\t<equality>',
-                f'\t\t<weld name="mover_weld_c0_{idx_magbot}" site1="m_{self.indices_mover_c0[idx_magbot]}_rail_site" '
-                f'site2="rail_mount_0_site_{idx_magbot}"/>',
-                f'\t\t<weld name="mover_weld_c1_{idx_magbot}" site1="m_{self.indices_mover_c1[idx_magbot]}_rail_site" '
-                f'site2="rail_mount_1_site_{idx_magbot}"/>',
-                f'\t\t<weld name="mover_weld_c2_{idx_magbot}" site1="m_{self.indices_mover_c2[idx_magbot]}_rail_site" '
-                f'site2="rail_mount_2_site_{idx_magbot}"/>',
+                # welds between the mover adapters and the rail mounts (switched by attach_mover() and detach_mover())
+                *self._mover_weld_xml_lines(idx_magbot=idx_magbot),
                 f'\t\t<joint joint1="k0_connection_joint_{idx_magbot}" joint2="k1_connection_joint_{idx_magbot}"/>',
                 f'\t\t<joint joint1="k0_connection_joint_{idx_magbot}" joint2="k0_toothed_belt_joint_{idx_magbot}"/>',
                 f'\t\t<joint joint1="k1_connection_joint_{idx_magbot}" joint2="k1_toothed_belt_joint_{idx_magbot}"/>',
@@ -1060,9 +1093,37 @@ class GripperMagBotsAPM4330:
 
         return custom_model_xml_strings
 
+    def _mover_adapter_xml_str(self, idx_mover: int, adapter_yaw: float) -> str:
+        """Generate the XML string of the mover adapter (incl. the site of the mover c-rotation actuator), which is added to the mover
+        body.
+
+        :param idx_mover: the index of the mover
+        :param adapter_yaw: the yaw of the adapter in the mover frame [rad]
+        :return: the XML string
+        """
+        # mover adapter meshes are visual-only if the station collision proxies are used
+        contact_attr = ' contype="0" conaffinity="0"' if self.station_proxies is not None else ''
+        rail_rod = '' if self.station_proxies is None else '\n' + self.station_proxies.rail_rod_xml_str(body_name=f'm_{idx_mover}_rail_rod')
+        lines = [
+            f'\t\t\t<site name="site_m_{idx_mover}" pos="0 0 0"/>',
+            f'\n\t\t\t<body name="m_{idx_mover}_rail" pos="0 0 0.006" gravcomp="1" euler="0 0 {adapter_yaw:.9f}">',
+            f'\t\t\t\t<geom name="m_{idx_mover}_to_mount_geom" type="mesh" mesh="mover_adapter" mass="0.065" pos="0 0 0" '
+            f'material="black"{contact_attr}/>',
+            f'\t\t\t\t<site name="m_{idx_mover}_rail_site" pos="0 0 0" euler="0 0 {self.MOVER_RAIL_SITE_YAW:.9f}" size="0.001" '
+            'type="sphere"/>',
+            f'\t\t\t\t<geom name="m_{idx_mover}_pin_1_geom" type="mesh" pos="-0.017 0 0.0125" euler="0 0 -1.5708" '
+            f'mesh="spring_loaded_pin" material="black"{contact_attr}/>',
+            f'\t\t\t\t<geom name="m_{idx_mover}_pin_2_geom" type="mesh" pos="0.017 0 0.0125" euler="0 0 1.5708" '
+            f'mesh="spring_loaded_pin" material="black"{contact_attr}/>',
+            f'\t\t\t\t<geom name="m_{idx_mover}_cover_base" type="mesh" pos="0 0 0.0167" mesh="cover_base" material="black"'
+            f'{contact_attr}/>' + rail_rod,
+            '\t\t\t</body>',
+        ]
+        return '\n'.join(lines)
+
     def generate_actuator_xml_strings(self) -> str:
-        """Generate MuJoCo XML strings for the c-rot actuators of the movers, gripper's a,b-rot actuators, and finger actuators of all
-        Gripper MagBots.
+        """Generate MuJoCo XML strings for the c-rot actuators of the movers (all movers with a mover adapter), gripper's a,b-rot actuators,
+        and finger actuators of all Gripper MagBots.
 
         :return: the MuJoCo XML actuator string (start '<actuator>' and end '</actuator>' are not included)
         """
@@ -1070,10 +1131,11 @@ class GripperMagBotsAPM4330:
         self.mover_actuator_names = []
         actuator_str_list = []
 
-        # mover actuators
-        for idx_mover in self.mover_indices.flatten():
+        # mover c-rotation actuators of all movers that can carry a rail mount (named differently from the c-rotation actuators of the
+        # MoverImpedanceController, which can control the c-rotations of the movers that are not attached)
+        for idx_mover in self.adapter_mover_indices:
             site_name = f'site_m_{idx_mover}'
-            current_actuator_name = f'mover_actuator_c_{idx_mover}'
+            current_actuator_name = f'magbot_mover_actuator_c_{idx_mover}'
             self.mover_actuator_names.append(current_actuator_name)
             actuator_str_list.append(f'\n\t\t<!-- actuators mover {idx_mover} -->')
             actuator_str_list.append(

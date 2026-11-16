@@ -130,7 +130,7 @@ def test_scripted_pick_and_place(env: ReconfigurationPlacementEnv) -> None:
     assert not info['is_success']
     goal_xy = obs['desired_goal']
 
-    # mover set poses of the pick-up (see the example in reconfiguration_env.py), connection idx_c is attached to mover idx_c
+    # mover set poses of the pick-up (see the example in reconfiguration_env.py), mover idx_c picks up connection idx_c
     station = env.stations[0]
     rot_station = station.rotation_matrix_xy()
     station_setposes = env.station_mover_poses[0].copy()
@@ -149,9 +149,13 @@ def test_scripted_pick_and_place(env: ReconfigurationPlacementEnv) -> None:
     drive(env, pre_station_setposes, speed=0.15)
     drive(env, entrance_setposes, speed=0.15)
     drive(env, station_setposes, speed=0.05)
-    assert (env.mover_station_indices == 0).all()
+    assert (env.connection_station_indices == 0).all() and (env.connection_mover_indices == -1).all()
     obs, reward, info = drive(env, taken_out_setposes, speed=0.15)
-    assert (env.mover_station_indices == -1).all()
+    assert (env.connection_station_indices == -1).all()
+    assert (env.connection_mover_indices[0] == np.arange(env.num_connections)).all()
+    # the observation contains the one-hot encoding of the attached connections (mover idx_c carries connection idx_c)
+    obs_movers = obs['observation'][: env.num_movers * env.num_obs_per_mover].reshape((env.num_movers, env.num_obs_per_mover))
+    assert np.array_equal(obs_movers[:, env.NUM_OBS_PER_MOVER_BASE :], np.eye(env.num_connections))
     assert not info['is_success'] and reward == env.reward_per_step
     obs, reward, info = drive(env, goal_setposes, speed=0.15)
     assert np.linalg.norm(obs['achieved_goal'] - goal_xy) <= env.threshold_pos

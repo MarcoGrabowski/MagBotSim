@@ -16,6 +16,11 @@ STATION_POSES = np.array([[0.480, 0.720, 0.01, np.deg2rad(-90)]])  # (x, y, z, y
 
 
 @pytest.fixture(params=ReconfigurationRLEnv.MAGBOT_TYPES)
+def magbot_type(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
+@pytest.fixture(params=ReconfigurationRLEnv.MAGBOT_TYPES)
 def env(request: pytest.FixtureRequest) -> ReconfigurationRLEnv:
     env = ReconfigurationRLEnv(magbot_types=(request.param,), station_poses=STATION_POSES, render_mode=None)
     yield env
@@ -27,11 +32,26 @@ def reset_fixed(env: ReconfigurationRLEnv, seed: int = 0) -> tuple[np.ndarray, d
     return env.reset(seed=seed, options={'mover_start_xy_pos': INITIAL_MOVER_XY_POS[env.magbot_type]})
 
 
+def split_obs(env: ReconfigurationRLEnv, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split the observation into the values per mover and the values per connection."""
+    num_obs_movers = env.num_movers * env.num_obs_per_mover
+    obs_movers = obs[:num_obs_movers].reshape((env.num_movers, env.num_obs_per_mover))
+    obs_connections = obs[num_obs_movers:].reshape((env.num_magbots * env.num_connections, ReconfigurationRLEnv.NUM_OBS_PER_CONNECTION))
+    return obs_movers, obs_connections
+
+
 @pytest.mark.filterwarnings('ignore:.*Box observation space.*infinity')
-def test_check_env(env: ReconfigurationRLEnv) -> None:
+@pytest.mark.parametrize('num_extra_movers', [0, 2])
+def test_check_env(magbot_type: str, num_extra_movers: int) -> None:
+    num_movers = ReconfigurationRLEnv.NUM_CONNECTIONS[magbot_type] + num_extra_movers
+    env = ReconfigurationRLEnv(magbot_types=(magbot_type,), num_movers=num_movers, station_poses=STATION_POSES, render_mode=None)
     check_env(env, skip_render_check=True)
+    assert env.num_movers == num_movers
     assert env.action_space.shape == (env.num_movers * 3,)
-    assert env.observation_space.shape == (env.num_movers * ReconfigurationRLEnv.NUM_OBS_PER_MOVER,)
+    assert env.num_obs_per_mover == ReconfigurationRLEnv.NUM_OBS_PER_MOVER_BASE + env.num_connections
+    num_obs = env.num_movers * env.num_obs_per_mover + env.num_connections * ReconfigurationRLEnv.NUM_OBS_PER_CONNECTION
+    assert env.observation_space.shape == (num_obs,)
+    env.close()
 
 
 def test_reset_info_and_obs(env: ReconfigurationRLEnv) -> None:
@@ -39,13 +59,15 @@ def test_reset_info_and_obs(env: ReconfigurationRLEnv) -> None:
     assert set(info.keys()) == COLLISION_KEYS
     assert all(value is False for value in info.values())
     assert env.observation_space.contains(obs)
-    obs_movers = obs.reshape((env.num_movers, ReconfigurationRLEnv.NUM_OBS_PER_MOVER))
-    # set poses at the start positions with a yaw of 0
+    obs_movers, obs_connections = split_obs(env, obs)
+    # set poses at the start positions with a yaw of 0, no mover attached
     assert np.allclose(obs_movers[:, 5:7], env.mover_start_xy_pos)
     assert np.allclose(obs_movers[:, 7], 0.0)
-    # rail mounts parked in the station
-    assert np.allclose(obs_movers[:, 8:10], env.get_rail_mount_xy())
-    assert np.all(obs_movers[:, 10] == 1.0)
+    assert np.all(obs_movers[:, 8:] == 0.0)
+    # rail mounts parked in the station, the docking yaws are the yaws of the movers in the station
+    assert np.allclose(obs_connections[:, :2], env.get_rail_mount_xy())
+    assert np.allclose(np.angle(np.exp(1j * (obs_connections[:, 2] - env.station_mover_poses[0, :, 5]))), 0.0, atol=1e-4)
+    assert np.all(obs_connections[:, 3] == 1.0)
 
 
 def test_actions_move_set_poses(env: ReconfigurationRLEnv) -> None:

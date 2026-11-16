@@ -45,6 +45,8 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
 
     :param magbot_types: the MagBot types that can be used, defaults to both types (see ``ReconfigurationEnv``). For vectorized
         environments, specify a single MagBot type, since the number of movers depends on the MagBot type.
+    :param num_movers: the number of movers, defaults to None, i.e. the number of connections of the chosen MagBot type (see
+        ``ReconfigurationEnv``)
     :param initial_mover_xy_pos: the initial (x, y) positions of the movers on the table [m] (see ``ReconfigurationRLEnv``), defaults
         to None, i.e. the start positions are sampled at each reset
     :param station_poses: the poses of the station anchors (see ``ReconfigurationEnv``), defaults to None
@@ -75,6 +77,7 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
     def __init__(
         self,
         magbot_types: Sequence[str] = ReconfigurationEnv.MAGBOT_TYPES,
+        num_movers: int | None = None,
         initial_mover_xy_pos: np.ndarray | dict[str, np.ndarray] | None = None,
         station_poses: np.ndarray | None = None,
         station_switch_tol: float = 0.001,
@@ -98,6 +101,7 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
 
         super().__init__(
             magbot_types=magbot_types,
+            num_movers=num_movers,
             initial_mover_xy_pos=initial_mover_xy_pos,
             station_poses=station_poses,
             station_switch_tol=station_switch_tol,
@@ -116,12 +120,13 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
         assert self.num_magbots == 1, 'the placement task is defined for a single MagBot'
         self.site_id_goal = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, self.GOAL_SITE_NAME)
 
-        # footprint of the movers if the MagBot is taken out of its station (MagBot 0 is parked in station 0) without rotation:
-        # mover positions relative to the MagBot position and half sizes of the axis-aligned bounding boxes of the movers (incl. margin)
+        # footprint of the movers carrying the MagBot if the MagBot is taken out of its station (MagBot 0 is parked in station 0) without
+        # rotation: mover positions relative to the MagBot position and half sizes of the axis-aligned bounding boxes of the movers (incl.
+        # margin), one mover per connection
         station_mover_xy = self.station_mover_poses[0, :, :2]
         self.goal_footprint_offsets = station_mover_xy - station_mover_xy.mean(axis=0)
         self.goal_footprint_yaws = self.station_mover_poses[0, :, 5].copy()
-        mover_half_sizes = self.get_c_size_arr(c_size=self.c_size, num_reps=self.num_movers) + self.c_size_offset
+        mover_half_sizes = self.get_c_size_arr(c_size=self.c_size, num_reps=self.num_movers)[: self.num_connections] + self.c_size_offset
         self.goal_footprint_half_extents = self._aabb_half_extents(mover_half_sizes + self.goal_margin, self.goal_footprint_yaws)
         # axis-aligned bounding boxes of the stations: the movers at the nominal station positions, enlarged by the MagBot randomization
         # range (shape: (num_stations, 2) each)

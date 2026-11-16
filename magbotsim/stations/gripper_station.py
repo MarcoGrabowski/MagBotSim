@@ -1,6 +1,6 @@
 import numpy as np
 
-from magbotsim.magbots.gripper import GripperMagBotsAPM4330Params
+from magbotsim.magbots.gripper import GripperMagBotsAPM4330, GripperMagBotsAPM4330Params
 from magbotsim.stations.station import Station
 
 
@@ -47,6 +47,8 @@ class GripperStation(Station):
     )  # [m]
     # the movers attached to connection 0 enter from -y, the movers attached to connection 1 and 2 from +y
     MOVER_ENTRY_SIGNS = np.array([-1.0, 1.0, 1.0])
+    # the mover docked at connection 0 is rotated by pi (all movers carry the standard mover adapter, see MagBotMoverCoupling)
+    MOVER_YAW_OFFSETS = GripperMagBotsAPM4330.MOVER_YAW_OFFSETS
     MESH_ASSETS = {
         'station_m0m1_mesh': './misc/reconfiguration_benchmark/station_m0m1.stl',
         'station_mount_m2_mesh': './misc/reconfiguration_benchmark/station_mount_m2.stl',

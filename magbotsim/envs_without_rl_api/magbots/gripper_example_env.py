@@ -86,6 +86,7 @@ class GripperMagBotExampleEnv(BasicMagBotEnv):
             # generate custom model XML strings for the two MagBots
             self.magbots = GripperMagBotsAPM4330(
                 num_magbots=self.num_magbots,
+                num_movers=self.num_movers,
                 indices_mover_c0=self.indices_mover_c0,
                 indices_mover_c1=self.indices_mover_c1,
                 indices_mover_c2=self.indices_mover_c2,

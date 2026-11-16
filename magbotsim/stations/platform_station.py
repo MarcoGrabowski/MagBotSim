@@ -15,8 +15,9 @@ class PlatformStation(Station):
     occupy the same place on the extrusion. See ``Station`` for the entry and take-out axes and the collision proxies.
 
     The mover attached to connection 0 (rail mount 0, mover b) is located at +y of the station body frame, the mover attached to
-    connection 1 (rail mount 1, mover a) at -y. Thus, the platform c-rotation (direction from mover a to mover b) is equal to the mover
-    rotation in the station, i.e. the platform of a parked MagBot is not tilted.
+    connection 1 (rail mount 1, mover a) at -y. Thus, the platform c-rotation (direction from mover a to mover b) is equal to the
+    kinematic connection yaws in the station, i.e. the platform of a parked MagBot is not tilted. The mover docked at connection 1 is
+    rotated by pi (see ``MOVER_YAW_OFFSETS``).
 
     :param pos: the (x, y, z) position of the station anchor in the world frame [m]
     :param yaw: the rotation of the whole station about the world z-axis [rad], defaults to 0.0
@@ -34,6 +35,8 @@ class PlatformStation(Station):
     )  # [m]
     # the flat sides of both rail mounts point outwards, i.e. the mover attached to connection 0 enters from +y, connection 1 from -y
     MOVER_ENTRY_SIGNS = np.array([1.0, -1.0])
+    # the mover docked at connection 1 (mover a) is rotated by pi (all movers carry the standard mover adapter, see MagBotMoverCoupling)
+    MOVER_YAW_OFFSETS = SixDPlatformMagBotsAPM4330.MOVER_YAW_OFFSETS
     MESH_ASSETS = {'station_m0m1_mesh': './misc/reconfiguration_benchmark/station_m0m1.stl'}
 
     def _mesh_geoms_xml_str(self) -> list[str]:

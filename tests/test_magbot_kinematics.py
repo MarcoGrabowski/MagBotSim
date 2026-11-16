@@ -15,6 +15,7 @@ def gripper_magbots():
     magbot_params = GripperMagBotsAPM4330Params()
     magbots = GripperMagBotsAPM4330(
         num_magbots=1,
+        num_movers=3,
         indices_mover_c0=np.array([0]),
         indices_mover_c1=np.array([1]),
         indices_mover_c2=np.array([2]),
@@ -99,6 +100,7 @@ def test_gripper_finger_roundtrip(gripper_magbots):
 def test_gripper_finger_angle_to_distance_without_calibration():
     magbots = GripperMagBotsAPM4330(
         num_magbots=1,
+        num_movers=3,
         indices_mover_c0=np.array([0]),
         indices_mover_c1=np.array([1]),
         indices_mover_c2=np.array([2]),
@@ -116,7 +118,7 @@ def test_gripper_finger_angle_to_distance_without_calibration():
 
 @pytest.fixture
 def platform_magbots():
-    return SixDPlatformMagBotsAPM4330(num_magbots=1, indices_mover_a=np.array([0]), indices_mover_b=np.array([1]))
+    return SixDPlatformMagBotsAPM4330(num_magbots=1, num_movers=2, indices_mover_a=np.array([0]), indices_mover_b=np.array([1]))
 
 
 def _sample_platform_poses(magbots: SixDPlatformMagBotsAPM4330, z_m: float, rng: np.random.Generator) -> np.ndarray:

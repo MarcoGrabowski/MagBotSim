@@ -1,6 +1,35 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+General
+^^^^^^^
+1. Flexible coupling between movers and MagBots (``MagBotMoverCoupling``, used by ``GripperMagBotsAPM4330`` and
+   ``SixDPlatformMagBotsAPM4330``):
+    - Both MagBot classes require the number of movers in the environment (``num_movers``, second argument).
+    - Dynamic mode (no mover indices): all movers carry the same mover adapter, and any mover can be attached to and detached from any
+      connection (rail mount) at runtime (``attach_mover()``, ``detach_mover()``). A mover docked at a connection that is entered from
+      the other side is rotated by pi (``MOVER_YAW_OFFSETS``).
+    - Static mode (``indices_mover_c0..c2`` / ``indices_mover_a/b``): the given movers are attached at initialization using the same
+      mechanism; the behavior is unchanged.
+    - ``GripperMagBotsAPM4330.control_gripper()`` couples only the attached movers. The kinematic yaw of a connection without a mover is
+      held, i.e. a parked gripper no longer moves when free movers rotate. The mover c-rotation actuators of the Gripper MagBot are named
+      ``magbot_mover_actuator_c_{idx_mover}``, and the mover welds ``mover_weld_m{idx_mover}_c{idx_c}_{idx_magbot}``.
+2. ``ReconfigurationEnv`` and its RL variants:
+    - Support more movers than connections (``num_movers``). The movers are assigned to the connections at runtime when they pick up a
+      rail mount (``connection_mover_indices``, ``connection_station_indices``). A mover is only attached if its adapter points in the
+      direction of the rail mount (mover yaw within +/-90 deg of the docking yaw), since a mover rotated by pi fits through the jaws.
+    - The c-rotation of a mover attached to a Gripper MagBot is controlled by the MagBot, the c-rotations of all other movers by the
+      impedance controllers. The control is switched when a mover is attached or detached.
+    - ``ReconfigurationRLEnv``: new observation layout (values per mover incl. a one-hot encoding of the attached connection, followed
+      by values per connection), see ``_get_obs()``.
+    - At initialization, the full model XML is saved next to ``reconfiguration_env.py``, e.g. ``reconfiguration_env_gripper.xml`` (see
+      ``save_model_xml()``, ``model_xml_path``).
+3. ``MoverImpedanceController.set_joint_mask()`` optionally sets the controls of disabled DoFs to zero (``data``) and no longer validates
+   the joint mask.
+
 Pre-Release v1.4.0a4 (2026-11-12)
 ---------------------------------
 

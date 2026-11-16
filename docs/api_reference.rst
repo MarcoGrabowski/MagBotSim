@@ -17,6 +17,7 @@ A detailed documentation of all basic environments, MagBots, and utilities can b
 
    api_reference/sixD_platform_magbot
    api_reference/gripper_magbot
+   api_reference/mover_coupling
 
 .. toctree::
    :maxdepth: 1

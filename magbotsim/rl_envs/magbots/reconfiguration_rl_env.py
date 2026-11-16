@@ -19,7 +19,7 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
     ``compute_terminated()`` and ``compute_truncated()`` (and the ``observation_space``), see e.g. ``ReconfigurationPlacementEnv``.
 
     Action: normalized increments of the mover set poses (x, y, yaw) for each mover (numpy array of shape (num_movers*3,) with values in
-    [-1, 1], connection order). The (x,y)-increments of each mover are clipped to a norm of at most 1 and scaled by
+    [-1, 1], mover order). The (x,y)-increments of each mover are clipped to a norm of at most 1 and scaled by
     ``v_max_xy * num_cycles * cycle_time``, the yaw increments are scaled by ``v_max_yaw * num_cycles * cycle_time``. The (x,y) set
     positions are clipped to the table. Within a step, the set poses are linearly interpolated from the previous to the new set poses
     over all cycles, i.e. the movers move with a constant set velocity. The z-position and the a,b-rotations of the set poses are fixed.
@@ -33,10 +33,13 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
     ``reward_per_step``. The episode is never truncated by the environment itself, i.e. use a ``TimeLimit`` wrapper to limit the
     episode length.
 
-    The MagBot type (and thus the number of movers and the shapes of the action and observation spaces) is chosen once at
-    initialization (see ``magbot_types``). For vectorized environments, specify a single MagBot type.
+    The MagBot type and the number of movers (and thus the shapes of the action and observation spaces) are chosen once at
+    initialization (see ``magbot_types`` and ``num_movers``). Any mover can pick up any rail mount of the MagBot (see
+    ``ReconfigurationEnv``). For vectorized environments, specify a single MagBot type.
 
     :param magbot_types: the MagBot types that can be used, defaults to both types (see ``ReconfigurationEnv``)
+    :param num_movers: the number of movers, defaults to None, i.e. the number of connections of the chosen MagBot type (see
+        ``ReconfigurationEnv``)
     :param initial_mover_xy_pos: the initial (x, y) positions of the movers on the table [m] (see ``ReconfigurationEnv``), defaults to
         None. If specified, the movers start at these positions after each reset (unless other positions are specified in the reset
         options), otherwise the start positions are sampled at each reset.
@@ -61,12 +64,15 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
 
     # collision types that terminate an episode (station_proxy_collision includes rail_rod_collision and station_pin_collision)
     COLLISION_KEYS = ('mover_collision', 'wall_collision', 'station_proxy_collision')
-    # number of observation values per mover (see _get_obs())
-    NUM_OBS_PER_MOVER = 11
+    # number of observation values per mover without the one-hot encoding of the attached connection (see _get_obs())
+    NUM_OBS_PER_MOVER_BASE = 8
+    # number of observation values per connection (see _get_obs())
+    NUM_OBS_PER_CONNECTION = 4
 
     def __init__(
         self,
         magbot_types: Sequence[str] = ReconfigurationEnv.MAGBOT_TYPES,
+        num_movers: int | None = None,
         initial_mover_xy_pos: np.ndarray | dict[str, np.ndarray] | None = None,
         station_poses: np.ndarray | None = None,
         station_switch_tol: float = 0.001,
@@ -88,6 +94,7 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
         # MRO: ReconfigurationEnv -> BasicMagBotSingleAgentEnv -> BasicMagBotEnv, i.e. the scene is created by the ReconfigurationEnv
         super().__init__(
             magbot_types=magbot_types,
+            num_movers=num_movers,
             initial_mover_xy_pos=initial_mover_xy_pos,
             station_poses=station_poses,
             station_switch_tol=station_switch_tol,
@@ -114,9 +121,9 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
         # action space: normalized (x, y, yaw) increments of the mover set poses
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.num_movers * 3,), dtype=np.float64)
         # observation space (see _get_obs())
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_movers * self.NUM_OBS_PER_MOVER,), dtype=np.float64
-        )
+        self.num_obs_per_mover = self.NUM_OBS_PER_MOVER_BASE + self.num_magbots * self.num_connections
+        num_obs = self.num_movers * self.num_obs_per_mover + self.num_magbots * self.num_connections * self.NUM_OBS_PER_CONNECTION
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(num_obs,), dtype=np.float64)
 
     ###################################################
     # Scene and set poses                             #
@@ -222,30 +229,44 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
     def _get_obs(self) -> np.ndarray:
         """Return an observation based on the current state of the environment.
 
-        :return: a numpy array of shape (num_movers*11,) containing the following values for each mover (connection order):
+        :return: a numpy array of shape (num_movers*num_obs_per_mover + num_magbots*num_connections*4,), which is the concatenation of
+            the following values for each mover (mover order, ``num_obs_per_mover`` = 8 + num_magbots*num_connections values per mover):
 
             - the current (x, y, yaw) of the mover (with noise) [m, m, rad]
             - the current (x, y) velocities of the mover (with noise) [m/s]
             - the current (x, y, yaw) set pose of the mover [m, m, rad] (the yaw is not wrapped)
-            - the current (x, y) position of the rail mount of the connection of the mover [m]
-            - whether the rail mount is parked in a station (1.0) or welded to the mover (0.0)
+            - the one-hot encoding of the connection to which the mover is attached (num_magbots*num_connections values, connection
+              order; all zeros if the mover is not attached)
+
+            and the following values for each connection (connection order):
+
+            - the current (x, y) position of the rail mount [m]
+            - the docking yaw of the rail mount, i.e. the yaw that a mover must have to pick up the rail mount (see
+              ``MagBotMoverCoupling.get_docking_mover_yaws()``) [rad]
+            - whether the rail mount is parked in a station (1.0) or carried by a mover (0.0)
         """
         mover_qpos = self.get_mover_qpos(mover_names=self.mover_names, add_noise=True)
         mover_yaws = rotations_utils.vec_quat2euler(mover_qpos[:, 3:])[:, 2]
         mover_xy_velos = self.get_mover_qvel(mover_names=self.mover_names, add_noise=True)[:, :2]
-        observation = np.concatenate(
+        # one-hot encoding of the attached connections
+        num_connections_total = self.num_magbots * self.num_connections
+        attached_one_hot = np.zeros((self.num_movers, num_connections_total))
+        indices_magbot, indices_c, indices_mover = self.magbots.get_carried_connections()
+        attached_one_hot[indices_mover, indices_magbot * self.num_connections + indices_c] = 1.0
+        observation_movers = np.concatenate(
+            [mover_qpos[:, :2], mover_yaws[:, np.newaxis], mover_xy_velos, self.mover_setposes[:, [0, 1, 5]], attached_one_hot], axis=1
+        )
+        assert observation_movers.shape == (self.num_movers, self.num_obs_per_mover)
+        observation_connections = np.concatenate(
             [
-                mover_qpos[:, :2],
-                mover_yaws[:, np.newaxis],
-                mover_xy_velos,
-                self.mover_setposes[:, [0, 1, 5]],
                 self.get_rail_mount_xy(),
-                (self.mover_station_indices >= 0).astype(np.float64)[:, np.newaxis],
+                self.magbots.get_docking_mover_yaws(self.data).reshape((-1, 1)),
+                self.connections_parked.astype(np.float64).reshape((-1, 1)),
             ],
             axis=1,
         )
-        assert observation.shape == (self.num_movers, self.NUM_OBS_PER_MOVER)
-        return observation.flatten()
+        assert observation_connections.shape == (num_connections_total, self.NUM_OBS_PER_CONNECTION)
+        return np.concatenate([observation_movers.flatten(), observation_connections.flatten()])
 
     def _preprocess_info_dict(self, info: np.ndarray | dict[str, Any] | None) -> tuple[bool, np.ndarray]:
         """Extract whether the info is batched and whether there is a collision (see ``COLLISION_KEYS``) from the info dictionary.

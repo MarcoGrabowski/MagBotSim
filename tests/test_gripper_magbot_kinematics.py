@@ -20,6 +20,7 @@ def magbots() -> GripperMagBotsAPM4330:
     """
     magbots = GripperMagBotsAPM4330(
         num_magbots=1,
+        num_movers=3,
         indices_mover_c0=np.array([0]),
         indices_mover_c1=np.array([1]),
         indices_mover_c2=np.array([2]),
@@ -99,6 +100,9 @@ def test_station_mover_pose_round_trip(magbots, station_yaw):
     z_m = 0.001
     station = GripperStation(pos=np.array([0.48, 0.72, 0.01]), yaw=station_yaw)
     station_mover_poses = station.get_mover_poses(z_m=z_m)[np.newaxis]
+    # the mover docked at connection 0 is rotated by pi (standard mover adapters), the kinematics use the kinematic connection yaws
+    station_mover_poses[:, :, 5] -= GripperStation.MOVER_YAW_OFFSETS
+    assert np.allclose(station_mover_poses[0, :, 5], station_mover_poses[0, 0, 5])
 
     gripper_pose = magbots.moverSetPose2GripperSetPose(mover_poses=station_mover_poses)
     mover_poses_rt = magbots.gripperSetPose2MoverSetPose(gripper_pose_d=gripper_pose, z_m=z_m)

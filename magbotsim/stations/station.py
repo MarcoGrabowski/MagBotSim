@@ -29,6 +29,10 @@ class Station:
     # connection order, i.e. [idx_c, :]: position of the mover attached to connection idx_c (numpy array of shape (num_connections, 2))
     MOVER_REL_XY_POS: np.ndarray = np.zeros((0, 2))  # [m]
     MOVER_REL_YAW = np.pi / 2  # [rad]
+    # additional yaw of the mover docked at connection idx_c (mover yaw - kinematic connection yaw of the MagBot, 0 or pi), i.e. the mover
+    # of a connection that is entered from the side of the flipped mover adapter is rotated by pi (see MagBotMoverCoupling) (numpy array
+    # of shape (num_connections,)). Defaults to zeros.
+    MOVER_YAW_OFFSETS: np.ndarray | None = None
     # side along the y-axis of the station body frame from which the mover attached to connection idx_c enters and leaves the station
     # (+1: from +y, -1: from -y), i.e. the side to which the flat side of the rail mount points (numpy array of shape (num_connections,))
     MOVER_ENTRY_SIGNS: np.ndarray = np.zeros(0)
@@ -63,16 +67,21 @@ class Station:
 
     def get_mover_poses(self, z_m: float) -> np.ndarray:
         """Return the mover poses in the world frame at which the MagBot is located in the station. At these positions, the rail mounts
-        can be switched between the movers and the station. The rotation of the station is considered.
+        can be switched between the movers and the station. The rotation of the station and the yaw offsets of the docked movers
+        (``MOVER_YAW_OFFSETS``) are considered.
 
         :param z_m: the mover z-pos (distance between the tile surface and the bottom of a mover) [m]
-        :return: the mover poses (numpy array of shape (num_connections, 6) using Euler angles (xyz) in rad).
-            [idx_c,:]: pose of the mover attached to connection idx_c
+        :return: the mover poses (numpy array of shape (num_connections, 6) using Euler angles (xyz) in rad). The yaws are the wrapped
+            yaw of the station (incl. ``MOVER_REL_YAW``) plus ``MOVER_YAW_OFFSETS``, i.e. they are not wrapped individually.
+            [idx_c,:]: pose of the mover docked at connection idx_c
         """
         mover_poses = np.zeros((self.num_connections, 6))
         mover_poses[:, :2] = self.pos[:2] + self.MOVER_REL_XY_POS @ self.rotation_matrix_xy().T
         mover_poses[:, 2] = z_m
-        mover_poses[:, 5] = np.arctan2(np.sin(self.yaw + self.MOVER_REL_YAW), np.cos(self.yaw + self.MOVER_REL_YAW))
+        # the yaw offsets are added after wrapping, so that the kinematic connection yaws (mover yaws - yaw offsets) of all connections are
+        # equal, which is required by the forward kinematics of the MagBots
+        yaw_offsets = np.zeros(self.num_connections) if self.MOVER_YAW_OFFSETS is None else self.MOVER_YAW_OFFSETS
+        mover_poses[:, 5] = np.arctan2(np.sin(self.yaw + self.MOVER_REL_YAW), np.cos(self.yaw + self.MOVER_REL_YAW)) + yaw_offsets
         return mover_poses
 
     def is_along_entry_axis(self, delta_xy: np.ndarray) -> bool:

@@ -3,6 +3,7 @@ __version__ = '1.4.0a4'
 from gymnasium.envs.registration import register
 
 from magbotsim.basic_magbot_env import BasicMagBotEnv
+from magbotsim.magbots.mover_coupling import MagBotMoverCoupling
 from magbotsim.magbots.sixD_platform import SixDPlatformMagBotsAPM4330
 from magbotsim.magbots.gripper import GripperMagBotsAPM4330, GripperMagBotsAPM4330Params
 from magbotsim.stations.station import Station
@@ -22,6 +23,7 @@ __all__ = [
     'GripperMagBotsAPM4330',
     'GripperMagBotsAPM4330Params',
     'GripperStation',
+    'MagBotMoverCoupling',
     'Matplotlib2DViewer',
     'MoverImpedanceController',
     'MujocoViewerCollection',
