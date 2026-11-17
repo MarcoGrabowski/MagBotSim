@@ -14,13 +14,15 @@ from magbotsim.utils.rotations_utils import vec_quat2euler
 # entering a station with the correct entry axis must not cause a collision, whereas entering diagonally must cause a collision.
 # Entering correctly is always checked first, i.e. a collision on the diagonal path is not caused by an earlier misalignment.
 # All tests that use the env fixture are run for both MagBot types (Gripper MagBot in a GripperStation, 6D-Platform MagBot in a
-# PlatformStation).
+# PlatformStation). A full rotation of a mover is only possible at rotation points, i.e. the movers rotate to the docking yaws at their
+# initial positions before they drive to the station.
 
 NUM_CYCLES = 20
-# initial mover positions in connection order (6D-Platform MagBot: connection 0 (mover b) is parked at the +x side of the station)
+# initial mover positions in connection order (6D-Platform MagBot: connection 0 (mover b) is parked at the +x side of the station). All
+# positions are rotation points (tile centers).
 INITIAL_MOVER_XY_POS = {
-    'gripper': np.array([[0.250, 0.150], [0.710, 0.150], [0.480, 0.150]]),  # [m]
-    'sixD_platform': np.array([[0.710, 0.150], [0.250, 0.150]]),  # [m]
+    'gripper': np.array([[0.240, 0.120], [0.720, 0.120], [0.480, 0.120]]),  # [m]
+    'sixD_platform': np.array([[0.720, 0.120], [0.240, 0.120]]),  # [m]
 }
 STATION_POSES = np.array([[0.480, 0.720, 0.01, np.deg2rad(-90)]])  # (x, y, z, yaw) of the station anchor
 
@@ -63,6 +65,9 @@ def poses(env: ReconfigurationEnv) -> dict[str, np.ndarray]:
     p['initial'] = p['station'].copy()
     p['initial'][:, :2] = initial_mover_xy_pos(env)
     p['initial'][:, 5] = 0.0
+    # initial positions (rotation points) with the docking yaws, i.e. the yaws of the movers in the station
+    p['initial_docking'] = p['station'].copy()
+    p['initial_docking'][:, :2] = initial_mover_xy_pos(env)
     # MagBot poses: MagBot in the station and taken out of the station by 0.25 m along the x-axis of the station body frame
     center = p['station'].copy()
     center[:, :2] += rot_station @ np.array([0.25, 0.0])
@@ -74,7 +79,14 @@ def poses(env: ReconfigurationEnv) -> dict[str, np.ndarray]:
     return p
 
 
-COLLISION_KEYS = {'mover_collision', 'wall_collision', 'station_proxy_collision', 'rail_rod_collision', 'station_pin_collision'}
+COLLISION_KEYS = {
+    'mover_collision',
+    'wall_collision',
+    'station_proxy_collision',
+    'rail_rod_collision',
+    'station_pin_collision',
+    'rotation_violation',
+}
 
 
 def is_parked(env: ReconfigurationEnv) -> bool:
@@ -91,10 +103,10 @@ def move_with_info(
     env: ReconfigurationEnv, start: np.ndarray, end: np.ndarray, duration: float, magbot: bool = False, hold: float = 0.5
 ) -> dict[str, bool]:
     """Move the movers (or the MagBot gripper / platform) linearly from start to end and hold the end pose. The movement is stopped
-    at the first station proxy collision.
+    at the first station proxy collision or rotation violation.
 
-    :return: the info dict returned by ``step()`` at the first station proxy collision, or of the last step if no station proxy
-        collision occurred
+    :return: the info dict returned by ``step()`` at the first station proxy collision or rotation violation, or of the last step if
+        neither occurred
     """
     dt = env.cycle_time * NUM_CYCLES
     setposes = [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))] + [end] * int(hold / dt)
@@ -104,7 +116,7 @@ def move_with_info(
         info = env.step(mover_setposes=mover_setposes, num_cycles=NUM_CYCLES)
         # step() stops at the first collision, i.e. the colliding contacts are still present after step()
         assert info['station_proxy_collision'] == env.check_station_proxy_collision()
-        if info['station_proxy_collision']:
+        if info['station_proxy_collision'] or info['rotation_violation']:
             break
     return info
 
@@ -112,9 +124,20 @@ def move_with_info(
 def move(env: ReconfigurationEnv, start: np.ndarray, end: np.ndarray, duration: float, magbot: bool = False, hold: float = 0.5) -> bool:
     """Move the movers (or the MagBot gripper / platform) linearly from start to end and hold the end pose.
 
-    :return: True if a station proxy collision occurred, False otherwise
+    :return: True if a station proxy collision or a rotation violation occurred, False otherwise
     """
-    return move_with_info(env, start, end, duration, magbot=magbot, hold=hold)['station_proxy_collision']
+    info = move_with_info(env, start, end, duration, magbot=magbot, hold=hold)
+    return info['station_proxy_collision'] or info['rotation_violation']
+
+
+def drive_to_pre_station(env: ReconfigurationEnv, poses: dict[str, np.ndarray], pre_station: np.ndarray) -> bool:
+    """Rotate the movers to the docking yaws at their initial positions (rotation points) and drive them to the pre-station poses.
+
+    :return: True if a station proxy collision or a rotation violation occurred, False otherwise
+    """
+    return move(env, poses['initial'], poses['initial_docking'], duration=1.0, hold=0.25) or move(
+        env, poses['initial_docking'], pre_station, duration=1.5
+    )
 
 
 def proxy_contact_names(env: ReconfigurationEnv) -> list[str]:
@@ -139,7 +162,7 @@ def test_no_collision_after_reset(env: ReconfigurationEnv) -> None:
 
 def test_empty_movers_diagonal_entry_collides(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> None:
     # the empty movers drive in front of the station (the MagBot is parked in the station)
-    assert not move(env, poses['initial'], poses['pre_station'], duration=1.5)
+    assert not drive_to_pre_station(env, poses, poses['pre_station'])
     assert is_parked(env)
     # the empty movers enter the station diagonally instead of along the entry axis -> the rail rods hit the jaws of the rail mounts
     info = move_with_info(env, poses['pre_station'], poses['station'], duration=1.5)
@@ -150,7 +173,7 @@ def test_empty_movers_diagonal_entry_collides(env: ReconfigurationEnv, poses: di
 
 def test_magbot_diagonal_entry_collides(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> None:
     # the empty movers enter the station along the entry axis and take the MagBot out of the station
-    assert not move(env, poses['initial'], poses['pre_station'], duration=1.5)
+    assert not drive_to_pre_station(env, poses, poses['pre_station'])
     assert not move(env, poses['pre_station'], poses['entrance'], duration=1.5)
     assert not move(env, poses['entrance'], poses['station'], duration=1.5)
     assert not move(env, poses['magbot_station'], poses['magbot_center'], duration=1.5, magbot=True)
@@ -189,6 +212,89 @@ def test_step_info_mover_and_wall_collision(env: ReconfigurationEnv, collision_t
             break
     assert info[collision_type]
     assert not info['station_proxy_collision']
+
+
+# Tests of the rotation limits: a full rotation of a mover is only possible at the default rotation points of the tiles (the centers,
+# corners and edge midpoints of the tiles that are surrounded by tiles), at all other positions the yaw may deviate at most 10 deg from
+# the nearest multiple of 90 deg. A rotation violation is treated like a collision.
+
+
+def step_infos(env: ReconfigurationEnv, start: np.ndarray, end: np.ndarray, duration: float, hold: float = 0.25) -> list[dict[str, bool]]:
+    """Move the movers linearly from start to end, hold the end pose and return the info dicts of all steps."""
+    dt = env.cycle_time * NUM_CYCLES
+    setposes = [start + s * (end - start) for s in np.linspace(0.0, 1.0, int(duration / dt))] + [end] * int(hold / dt)
+    return [env.step(mover_setposes=setpose, num_cycles=NUM_CYCLES) for setpose in setposes]
+
+
+def test_default_rotation_points(env: ReconfigurationEnv) -> None:
+    assert np.allclose(env.rotation_points, env.get_tile_rotation_points())
+    # the initial mover positions of the tests are rotation points
+    assert env.full_rotation_possible(qpos=env.get_mover_qpos(mover_names=env.mover_names)).all()
+    assert not env.check_rotation_violation()
+
+
+def test_full_rotation_at_rotation_points(env: ReconfigurationEnv) -> None:
+    # all movers rotate by pi at their initial positions (rotation points)
+    start = initial_poses(env)
+    end = start.copy()
+    end[:, 5] = np.pi
+    infos = step_infos(env, start, end, duration=1.0)
+    assert not any(info[key] for info in infos for key in COLLISION_KEYS)
+    yaws = vec_quat2euler(env.get_mover_qpos(mover_names=env.mover_names)[:, 3:])[:, 2]
+    assert np.allclose(np.angle(np.exp(1j * (yaws - np.pi))), 0.0, atol=np.deg2rad(1.0))
+
+
+@pytest.mark.parametrize('yaw_deg', [5.0, -9.0, 45.0])
+def test_rotation_between_rotation_points(env: ReconfigurationEnv, yaw_deg: float) -> None:
+    # mover 0 drives to a position between the rotation points (0.085 m away from the nearest one) and rotates there
+    start = initial_poses(env)
+    off = start.copy()
+    off[0, :2] += 0.06
+    assert not any(info[key] for info in step_infos(env, start, off, duration=0.5) for key in COLLISION_KEYS)
+    rotated = off.copy()
+    rotated[0, 5] = np.deg2rad(yaw_deg)
+    infos = step_infos(env, off, rotated, duration=0.5)
+    violation = abs(yaw_deg) > 10.0
+    assert any(info['rotation_violation'] for info in infos) == violation
+    if violation:
+        # treated like a collision: the remaining cycles of a step are skipped
+        assert env.check_rotation_violation(add_qpos_noise=False)
+        time_before = env.data.time
+        info = env.step(mover_setposes=rotated, num_cycles=NUM_CYCLES)
+        assert {key for key, value in info.items() if value} == {'rotation_violation'}
+        assert env.data.time - time_before < 0.5 * NUM_CYCLES * env.cycle_time
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'xy_offset', 'yaw_deg', 'expected'),
+    [
+        ({}, 0.0, 45.0, False),  # rotation point
+        ({}, 0.0007, 45.0, False),  # within the default tolerance of 1 mm (distance 0.99 mm)
+        ({}, 0.0008, 45.0, True),  # outside the default tolerance (distance 1.13 mm)
+        ({}, 0.06, 9.0, False),
+        ({}, 0.06, 81.0, False),  # 9 deg from 90 deg
+        ({}, 0.06, 45.0, True),
+        ({'max_yaw_deviation': np.deg2rad(30.0)}, 0.06, 25.0, False),
+        ({'max_yaw_deviation': np.deg2rad(30.0)}, 0.06, 35.0, True),
+        ({'rotation_tol': 0.09}, 0.06, 45.0, False),  # within the larger tolerance (distance 0.085 m)
+    ],
+)
+def test_check_rotation_violation(kwargs: dict, xy_offset: float, yaw_deg: float, expected: bool) -> None:
+    env = ReconfigurationEnv(
+        magbot_types=('sixD_platform',),
+        initial_mover_xy_pos=INITIAL_MOVER_XY_POS,
+        station_poses=STATION_POSES,
+        render_mode=None,
+        **kwargs,
+    )
+    # teleport mover 0 (x, y and yaw)
+    yaw = np.deg2rad(yaw_deg)
+    qpos_indices = env.mover_qpos_indices[0]
+    env.data.qpos[qpos_indices[:2]] += xy_offset
+    env.data.qpos[qpos_indices[3:]] = [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]
+    mujoco.mj_forward(env.model, env.data)
+    assert env.check_rotation_violation(add_qpos_noise=False) == expected
+    env.close()
 
 
 # Tests of the randomization of the reconfiguration env: random collision-free mover start positions and random shift of the MagBot
@@ -271,7 +377,7 @@ def test_shifted_magbot_pickup_and_putback(env: ReconfigurationEnv, poses: dict[
     env.reset_scene(mover_start_xy_pos=initial_mover_xy_pos(env), magbot_station_x_offsets=np.array([0.004]))
     pickup = pickup_poses(env, poses)
     # the empty movers enter the station at the real rail mount positions and take the MagBot out of the station
-    assert not move(env, poses['initial'], pickup['pre_station'], duration=1.5)
+    assert not drive_to_pre_station(env, poses, pickup['pre_station'])
     assert not move(env, pickup['pre_station'], pickup['entrance'], duration=1.5)
     assert not move(env, pickup['entrance'], pickup['station'], duration=1.5)
     assert is_parked(env)
@@ -290,7 +396,7 @@ def test_shifted_magbot_pickup_and_putback(env: ReconfigurationEnv, poses: dict[
 
 def test_putback_off_nominal_does_not_switch(env: ReconfigurationEnv, poses: dict[str, np.ndarray]) -> None:
     # the movers take the MagBot out of the station
-    assert not move(env, poses['initial'], poses['pre_station'], duration=1.5)
+    assert not drive_to_pre_station(env, poses, poses['pre_station'])
     assert not move(env, poses['pre_station'], poses['entrance'], duration=1.5)
     assert not move(env, poses['entrance'], poses['station'], duration=1.5)
     assert not move(env, poses['magbot_station'], poses['magbot_center'], duration=1.5, magbot=True)

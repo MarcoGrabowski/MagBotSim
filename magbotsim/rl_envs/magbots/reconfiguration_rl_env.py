@@ -27,11 +27,12 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
     Observation: see ``_get_obs()``.
 
     Info: the collision types of the ``ReconfigurationEnv`` (see ``ReconfigurationEnv._get_info()``), i.e. ``mover_collision``,
-    ``wall_collision``, ``station_proxy_collision``, ``rail_rod_collision`` and ``station_pin_collision``.
+    ``wall_collision``, ``station_proxy_collision``, ``rail_rod_collision``, ``station_pin_collision`` and ``rotation_violation``
+    (see ``ReconfigurationEnv.check_rotation_violation()``).
 
-    Reward and termination: ``reward_collision`` and termination if there is a mover, wall or station proxy collision, otherwise
-    ``reward_per_step``. The episode is never truncated by the environment itself, i.e. use a ``TimeLimit`` wrapper to limit the
-    episode length.
+    Reward and termination: ``reward_collision`` and termination if there is a mover, wall or station proxy collision or a rotation
+    violation, otherwise ``reward_per_step``. The episode is never truncated by the environment itself, i.e. use a ``TimeLimit`` wrapper
+    to limit the episode length.
 
     The MagBot type and the number of movers (and thus the shapes of the action and observation spaces) are chosen once at
     initialization (see ``magbot_types`` and ``num_movers``). Any mover can pick up any rail mount of the MagBot (see
@@ -51,6 +52,10 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
         ``ReconfigurationEnv``), defaults to False
     :param magbot_station_randomization_x_range: the half-range of the random MagBot offset [m] (see ``ReconfigurationEnv``), defaults
         to 0.005
+    :param rotation_tol: the maximum distance to a rotation point at which a full rotation of a mover is possible [m] (see
+        ``ReconfigurationEnv``), defaults to 0.001
+    :param max_yaw_deviation: the maximum yaw deviation from the nearest multiple of 90 deg if a mover is not at a rotation point [rad]
+        (see ``ReconfigurationEnv``), defaults to 10 deg
     :param num_cycles: the number of control cycles per step, defaults to 40
     :param render_every_cycle: whether to call ``render()`` after each integrator step, defaults to False
     :param v_max_xy: the maximum (x,y) set velocity of each mover [m/s], defaults to 2.0
@@ -62,8 +67,9 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
     :param render_mode: the render mode, defaults to 'human'. Use None to run without rendering (e.g. for training).
     """
 
-    # collision types that terminate an episode (station_proxy_collision includes rail_rod_collision and station_pin_collision)
-    COLLISION_KEYS = ('mover_collision', 'wall_collision', 'station_proxy_collision')
+    # collision types that terminate an episode (station_proxy_collision includes rail_rod_collision and station_pin_collision); a
+    # rotation violation is treated like a collision
+    COLLISION_KEYS = ('mover_collision', 'wall_collision', 'station_proxy_collision', 'rotation_violation')
     # number of observation values per mover without the one-hot encoding of the attached connection (see _get_obs())
     NUM_OBS_PER_MOVER_BASE = 8
     # number of observation values per connection (see _get_obs())
@@ -79,6 +85,8 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
         station_proxy_tol: float = 0.002,
         randomize_magbot_station_pos: bool = False,
         magbot_station_randomization_x_range: float = 0.005,
+        rotation_tol: float = 0.001,
+        max_yaw_deviation: float = np.deg2rad(10.0),
         num_cycles: int = 40,
         render_every_cycle: bool = False,
         v_max_xy: float = 2.0,
@@ -101,6 +109,8 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
             station_proxy_tol=station_proxy_tol,
             randomize_magbot_station_pos=randomize_magbot_station_pos,
             magbot_station_randomization_x_range=magbot_station_randomization_x_range,
+            rotation_tol=rotation_tol,
+            max_yaw_deviation=max_yaw_deviation,
             seed=seed,
             render_mode=render_mode,
         )
@@ -299,7 +309,8 @@ class ReconfigurationRLEnv(ReconfigurationEnv, BasicMagBotSingleAgentEnv):
     def compute_terminated(
         self, achieved_goal: np.ndarray | None = None, desired_goal: np.ndarray | None = None, info: dict[str, Any] | None = None
     ) -> np.ndarray | bool:
-        """Check whether a terminal state is reached, i.e. whether there is a mover, wall or station proxy collision.
+        """Check whether a terminal state is reached, i.e. whether there is a mover, wall or station proxy collision or a rotation
+        violation.
 
         :param achieved_goal: not used in this environment, defaults to None
         :param desired_goal: not used in this environment, defaults to None

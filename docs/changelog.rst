@@ -37,7 +37,19 @@ General
     - A product that rests in the bin is counted as delivered (``num_delivered_products``), a product that rests outside the bin below
       the platform heights as dropped (``num_dropped_products``). In both cases, it is respawned in the supply rack
       (``respawn_product()``). ``step()`` reports both events in the info dict (``product_delivered``, ``product_dropped``).
-    - Scripted demo movements (``run_magbot_pickup()``, ``run_transport_cycle()``), used by the demo of the script and by the tests.
+    - Minimal demo in the script: pickup of the MagBot and transport cycles using the platform set poses of the task (e.g.
+      ``SUPPLY_PLATFORM_POSE``, ``BIN_PLATFORM_POSE``).
+5. Rotation limits in ``ReconfigurationEnv``, its RL variants and ``ReconfigurationTransportEnv``:
+    - ``check_rotation_violation()`` checks the rotation limits of all movers in every cycle using ``check_mover_rotation()`` with the
+      default rotation points of the tiles (``get_tile_rotation_points()``). The tolerance and the max. yaw deviation can be configured
+      (``rotation_tol``, ``max_yaw_deviation``).
+    - A rotation violation is treated like a collision: ``step()`` reports it in the info dict (``rotation_violation``) and skips the
+      remaining cycles, and the RL variants penalize it (``reward_collision``) and terminate the episode.
+    - The demos rotate the movers only at rotation points (hard-coded start positions of the movers). In
+      ``ReconfigurationTransportEnv``, the platform is tilted at the bin with mover a at the rotation point (0.12, 0.12), i.e.
+      ``BIN_PLATFORM_POSE`` and ``BIN_POSE`` are shifted by -0.02959 m in x (and the platform by -0.013 m in y).
+6. The demos of ``ReconfigurationEnv`` and ``ReconfigurationTransportEnv`` are reduced to minimal examples (one mover per connection,
+   hard-coded start positions at rotation points).
 
 Pre-Release v1.4.0a5 (2026-11-17)
 ---------------------------------

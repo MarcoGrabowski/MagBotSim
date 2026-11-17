@@ -6,7 +6,14 @@ from magbotsim.rl_envs.magbots.reconfiguration_rl_env import ReconfigurationRLEn
 
 # Tests of the RL variant (Gymnasium API) of the reconfiguration env. All tests that use the env fixture are run for both MagBot types.
 
-COLLISION_KEYS = {'mover_collision', 'wall_collision', 'station_proxy_collision', 'rail_rod_collision', 'station_pin_collision'}
+COLLISION_KEYS = {
+    'mover_collision',
+    'wall_collision',
+    'station_proxy_collision',
+    'rail_rod_collision',
+    'station_pin_collision',
+    'rotation_violation',
+}
 # initial mover positions in connection order (6D-Platform MagBot: connection 0 (mover b) is parked at the +x side of the station)
 INITIAL_MOVER_XY_POS = {
     'gripper': np.array([[0.250, 0.150], [0.710, 0.150], [0.480, 0.150]]),  # [m]
@@ -113,6 +120,23 @@ def test_wall_collision_terminates(env: ReconfigurationRLEnv) -> None:
     assert reward == env.reward_collision
 
 
+def test_rotation_violation_terminates(env: ReconfigurationRLEnv) -> None:
+    reset_fixed(env)
+    # the start position of mover 0 is not a rotation point, i.e. its yaw may deviate at most 10 deg from the nearest multiple of 90 deg
+    assert not env.full_rotation_possible(qpos=env.get_mover_qpos(mover_names=env.mover_names)[:1]).any()
+    action = np.zeros((env.num_movers, 3))
+    action[0, 2] = 1.0  # mover 0 rotates at the maximum yaw velocity
+    terminated, info, reward, num_steps = False, {}, 0.0, 0
+    while not terminated and num_steps < 50:
+        _, reward, terminated, _, info = env.step(action.flatten())
+        num_steps += 1
+    assert terminated
+    assert {key for key in COLLISION_KEYS if info[key]} == {'rotation_violation'}
+    assert reward == env.reward_collision
+    # the yaw exceeds 10 deg after 3 steps (3.6 deg per step), the actual yaw lags behind the set yaw
+    assert 3 <= num_steps <= 6
+
+
 def test_initial_mover_xy_pos_reused_at_reset() -> None:
     kwargs = {'magbot_types': ('sixD_platform',), 'station_poses': STATION_POSES, 'render_mode': None}
     env = ReconfigurationRLEnv(initial_mover_xy_pos=INITIAL_MOVER_XY_POS, **kwargs)
@@ -136,8 +160,11 @@ def test_batched_reward_and_termination(env: ReconfigurationRLEnv) -> None:
             no_collision,
             {**no_collision, 'wall_collision': True},
             {**no_collision, 'station_proxy_collision': True, 'rail_rod_collision': True},
+            {**no_collision, 'rotation_violation': True},
         ]
     )
-    assert np.allclose(env.compute_reward(info=infos), [env.reward_per_step, env.reward_collision, env.reward_collision])
-    assert np.array_equal(env.compute_terminated(info=infos), [False, True, True])
-    assert np.array_equal(env.compute_truncated(info=infos), [False, False, False])
+    assert np.allclose(
+        env.compute_reward(info=infos), [env.reward_per_step, env.reward_collision, env.reward_collision, env.reward_collision]
+    )
+    assert np.array_equal(env.compute_terminated(info=infos), [False, True, True, True])
+    assert np.array_equal(env.compute_truncated(info=infos), [False, False, False, False])

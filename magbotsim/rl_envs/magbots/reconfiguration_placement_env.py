@@ -31,9 +31,9 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
     - ``achieved_goal``: the current MagBot position (numpy array of shape (2,)) [m]
     - ``desired_goal``: the goal position of the MagBot (numpy array of shape (2,)) [m]
 
-    Reward (sparse): ``reward_collision`` in case of a mover, wall or station proxy collision, 0 if the MagBot is within
-    ``threshold_pos`` of the goal, ``reward_per_step`` otherwise. The reward only depends on the goals and the collision information of
-    the info dictionary, so that it can be recomputed for relabeled goals (HER).
+    Reward (sparse): ``reward_collision`` in case of a mover, wall or station proxy collision or a rotation violation, 0 if the MagBot
+    is within ``threshold_pos`` of the goal, ``reward_per_step`` otherwise. The reward only depends on the goals and the collision
+    information of the info dictionary, so that it can be recomputed for relabeled goals (HER).
 
     Termination and truncation: an episode terminates in case of a collision (see ``ReconfigurationRLEnv``). Reaching the goal does not
     terminate the episode, i.e. the agent has to keep the MagBot at the goal. The episode is never truncated by the environment itself,
@@ -57,6 +57,10 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
         ``ReconfigurationEnv``), defaults to False
     :param magbot_station_randomization_x_range: the half-range of the random MagBot offset [m] (see ``ReconfigurationEnv``), defaults
         to 0.005
+    :param rotation_tol: the maximum distance to a rotation point at which a full rotation of a mover is possible [m] (see
+        ``ReconfigurationEnv``), defaults to 0.001
+    :param max_yaw_deviation: the maximum yaw deviation from the nearest multiple of 90 deg if a mover is not at a rotation point [rad]
+        (see ``ReconfigurationEnv``), defaults to 10 deg
     :param num_cycles: the number of control cycles per step, defaults to 40
     :param render_every_cycle: whether to call ``render()`` after each integrator step, defaults to False
     :param v_max_xy: the maximum (x,y) set velocity of each mover [m/s], defaults to 2.0
@@ -84,6 +88,8 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
         station_proxy_tol: float = 0.002,
         randomize_magbot_station_pos: bool = False,
         magbot_station_randomization_x_range: float = 0.005,
+        rotation_tol: float = 0.001,
+        max_yaw_deviation: float = np.deg2rad(10.0),
         num_cycles: int = 40,
         render_every_cycle: bool = False,
         v_max_xy: float = 2.0,
@@ -108,6 +114,8 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
             station_proxy_tol=station_proxy_tol,
             randomize_magbot_station_pos=randomize_magbot_station_pos,
             magbot_station_randomization_x_range=magbot_station_randomization_x_range,
+            rotation_tol=rotation_tol,
+            max_yaw_deviation=max_yaw_deviation,
             num_cycles=num_cycles,
             render_every_cycle=render_every_cycle,
             v_max_xy=v_max_xy,
@@ -277,10 +285,11 @@ class ReconfigurationPlacementEnv(ReconfigurationRLEnv):
 
         :param mover_collision: whether there is a collision between two movers
         :param wall_collision: whether there is a collision between a mover and a wall
-        :param other_collision: whether there is a station proxy collision
+        :param other_collision: whether there is a station proxy collision or a rotation violation
         :param achieved_goal: the current MagBot position (numpy array of shape (2,)), defaults to None, i.e. ``get_magbot_xy()``
         :param desired_goal: the goal position of the MagBot (numpy array of shape (2,)), defaults to None, i.e. ``goal_xy``
-        :param collision_info: the station proxy collision types (see ``get_station_proxy_collisions()``), defaults to None
+        :param collision_info: the station proxy collision types and the rotation violation (see
+            ``_check_for_other_collisions_callback()``), defaults to None
         :return: the info dictionary
         """
         info = super()._get_info(

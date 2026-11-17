@@ -7,18 +7,22 @@ import pytest
 from magbotsim import PlatformStation
 from magbotsim.envs_without_rl_api.magbots import reconfiguration_transport_env as transport_env_module
 from magbotsim.envs_without_rl_api.magbots.reconfiguration_env import ReconfigurationEnv
-from magbotsim.envs_without_rl_api.magbots.reconfiguration_transport_env import (
-    ReconfigurationTransportEnv,
-    run_magbot_pickup,
-    run_transport_cycle,
-)
+from magbotsim.envs_without_rl_api.magbots.reconfiguration_transport_env import ReconfigurationTransportEnv
 
 # Tests of the reconfiguration transport env: two movers pick up the 6D-Platform MagBot from the station and transport products from
-# the supply rack (bottom long side) to the bin (right short side). The product is respawned in the supply rack after each delivery.
+# the supply rack to the bin (both at the bottom long side). The product is respawned in the supply rack after each delivery. The
+# scripted transport task (pickup and transport cycles) is tested in the MagBotSim_Solutions repository.
 
 NUM_CYCLES = 20
 INITIAL_MOVER_XY_POS = np.array([[0.130, 0.100], [0.860, 0.100]])  # [m]
-COLLISION_KEYS = {'mover_collision', 'wall_collision', 'station_proxy_collision', 'rail_rod_collision', 'station_pin_collision'}
+COLLISION_KEYS = {
+    'mover_collision',
+    'wall_collision',
+    'station_proxy_collision',
+    'rail_rod_collision',
+    'station_pin_collision',
+    'rotation_violation',
+}
 PRODUCT_KEYS = {'product_delivered', 'product_dropped'}
 
 
@@ -106,16 +110,16 @@ def test_product_dropped_and_respawned(env: ReconfigurationTransportEnv) -> None
     assert env.num_dropped_products == 0
 
 
-def test_transport_cycle(env: ReconfigurationTransportEnv) -> None:
-    # the movers pick up the MagBot from the station
-    infos = run_magbot_pickup(env, num_cycles=NUM_CYCLES)
-    assert (env.connection_station_indices == -1).all()
-    assert sorted(env.connection_mover_indices[0].tolist()) == [0, 1]
-    # one product is transported from the supply rack to the bin without collisions
-    infos += run_transport_cycle(env, num_cycles=NUM_CYCLES)
-    assert not any(info[key] for info in infos for key in COLLISION_KEYS)
-    assert env.num_delivered_products == 1 and env.num_dropped_products == 0
-    assert np.allclose(env.get_product_qpos()[:3], env.PRODUCT_SUPPLY_POS, atol=0.001)
+def test_bin_platform_pose_at_rotation_point(env: ReconfigurationTransportEnv) -> None:
+    # tilting the platform rotates mover a (connection 1) by more than the max. yaw deviation, i.e. mover a must be at a rotation point
+    dump = env.BIN_PLATFORM_POSE.copy()
+    dump[3] = env.DUMP_PLATFORM_A_ROT
+    mover_poses = env.get_mover_poses_from_magbot_setpose(magbot_setposes=dump.reshape((1, 6)))
+    yaw_change = np.angle(np.exp(1j * (mover_poses[1, 5] - env.station_mover_poses[0, 1, 5])))
+    assert abs(yaw_change) > np.deg2rad(10.0)
+    qpos = np.zeros((1, 7))
+    qpos[0, :2] = mover_poses[1, :2]
+    assert env.full_rotation_possible(qpos=qpos)[0]
 
 
 def test_random_mover_start_positions() -> None:

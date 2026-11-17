@@ -42,6 +42,13 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
     ``model_xml_path``), e.g. to inspect the generated model or to load it in the MuJoCo viewer. The file is overwritten by every new
     environment instance.
 
+    The rotation limits of the MagLev system are checked in every cycle (see ``check_rotation_violation()``): a full rotation of a mover
+    around the z-axis is only possible within ``rotation_tol`` of one of the default rotation points (``get_tile_rotation_points()``, i.e.
+    the centers, corners and edge midpoints of the tiles that are surrounded by tiles). At all other positions, the yaw of a mover may
+    deviate at most ``max_yaw_deviation`` from the nearest multiple of 90 deg. Thus, the movers rotate to the docking yaws at rotation
+    points, and the platform is tilted at the bin with mover a (alpha-rotation) at a rotation point, since the platform a,b-rotations
+    rotate movers a and b. A rotation violation is treated like a collision.
+
     ``step()`` returns an info dictionary that contains the collision types and the product events (all bool):
 
     - ``mover_collision``: collision between two movers
@@ -52,6 +59,7 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
       larger than the station proxy tolerance (the rail rod hits the jaws of a rail mount)
     - ``station_pin_collision``: contact of a station pin, e.g. a MagBot carried by movers is moved into or out of a station with a
       sideways misalignment larger than the station proxy tolerance (the rail mount hits the station pins)
+    - ``rotation_violation``: a mover violates the rotation limits (see ``check_rotation_violation()``)
     - ``product_delivered``: the product came to rest in the bin during this step (it has been respawned in the supply rack)
     - ``product_dropped``: the product came to rest outside the bin below the platform heights during this step (it has been respawned
       in the supply rack)
@@ -68,6 +76,10 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
         (take-out axis, i.e. along the station pins) at each reset, defaults to False. All rail mounts get the same offset.
     :param magbot_station_randomization_x_range: the half-range of the uniform random offset of the MagBot along the station x-axis
         [m], defaults to 0.005. Only used if ``randomize_magbot_station_pos`` is True.
+    :param rotation_tol: the maximum (x,y) distance between the center of a mover and a rotation point at which a full rotation is
+        still possible [m], defaults to 0.001 (see ``check_rotation_violation()``)
+    :param max_yaw_deviation: the maximum deviation of the yaw of a mover from the nearest multiple of 90 deg if the mover is not at a
+        rotation point [rad], defaults to 10 deg (see ``check_rotation_violation()``)
     :param seed: the seed of the RNG used for the randomization (``self.rng``), defaults to None
     :param render_mode: the render mode, defaults to 'human'. Use None to run without rendering (e.g. in tests).
     """
@@ -94,9 +106,9 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
     # position of the product in the supply rack (x, y, z) [m]
     PRODUCT_SUPPLY_POS = np.array([0.61019, 0.0673, 0.22752 + FRAME_Z_OFFSET])
     # pose of the bin (x, y, z, yaw) at the bottom long side of the table, left of the supply rack: the container of the application
-    # example (top long side) mirrored to the bottom long side, i.e. it hangs outside the bottom profile of the frame (x from 0.25 to
-    # 0.45 m)
-    BIN_POSE = np.array([0.25, -0.0555, -0.037 + FRAME_Z_OFFSET, 0.0])
+    # example (top long side) mirrored to the bottom long side, i.e. it hangs outside the bottom profile of the frame (x from 0.22041 to
+    # 0.42041 m, i.e. centered below the platform at the bin, see BIN_PLATFORM_POSE)
+    BIN_POSE = np.array([0.22041, -0.0555, -0.037 + FRAME_Z_OFFSET, 0.0])
     # inner box of the bin in the bin body frame: (x_min, x_max), (y_min, y_max), z_max (rim) [m]
     BIN_INNER_X_RANGE = (0.003, 0.197)
     BIN_INNER_Y_RANGE = (-0.150, 0.0)
@@ -115,9 +127,12 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
     # the platform is pulled out of the supply rack with the product (the platform is clear of the poles) and moves to the bin at this
     # y-position
     RETRACT_PLATFORM_Y = 0.222
-    # above the bin, the platform is as close to the bottom long side as the supply pose, i.e. the product rests at the bin-side edge of
-    # the platform. When the platform is tilted towards the bin, the product tips over this edge and falls over the frame into the bin.
-    BIN_PLATFORM_POSE = np.array([0.35, 0.133, PICK_PLATFORM_Z, 0.0, 0.0, 0.0])
+    # above the bin, the platform is close to the bottom long side, i.e. the product rests at the bin-side edge of the platform. When the
+    # platform is tilted towards the bin, the product tips over this edge and falls over the frame into the bin. Tilting the platform
+    # rotates mover a (gear ratio ~8.4, i.e. the max. yaw deviation of 10 deg only allows a tilt of ~1.2 deg), i.e. mover a must be at a
+    # rotation point: with the mover distance at PICK_PLATFORM_Z (0.40082 m), mover a is at the center of the bottom left tile
+    # (0.12, 0.12) and mover b at (0.52082, 0.12).
+    BIN_PLATFORM_POSE = np.array([0.32041, 0.12, PICK_PLATFORM_Z, 0.0, 0.0, 0.0])
     DUMP_PLATFORM_A_ROT = 0.244  # [rad] tilt towards -y (bin), i.e. the max. platform a-rotation
 
     def __init__(
@@ -127,6 +142,8 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
         station_proxy_tol: float = 0.002,
         randomize_magbot_station_pos: bool = False,
         magbot_station_randomization_x_range: float = 0.005,
+        rotation_tol: float = 0.001,
+        max_yaw_deviation: float = np.deg2rad(10.0),
         seed: int | None = None,
         render_mode: str | None = 'human',
     ) -> None:
@@ -135,6 +152,11 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
         self.randomize_magbot_station_pos = randomize_magbot_station_pos
         assert magbot_station_randomization_x_range >= 0.0
         self.magbot_station_randomization_x_range = magbot_station_randomization_x_range
+
+        # rotation limits (the default rotation points of the tiles are used, see check_rotation_violation())
+        assert rotation_tol >= 0.0 and max_yaw_deviation >= 0.0
+        self.rotation_tol = rotation_tol
+        self.max_yaw_deviation = max_yaw_deviation
 
         self.num_connections = self.NUM_CONNECTIONS
         mover_count = self.NUM_MOVERS
@@ -787,24 +809,45 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
         """
         return self.get_station_proxy_collisions()['station_proxy_collision']
 
+    def check_rotation_violation(self, add_qpos_noise: bool = True) -> bool:
+        """Check whether any mover violates the rotation limits of the MagLev system (see ``BasicMagBotEnv.check_mover_rotation()``):
+        a full rotation around the z-axis is only possible within ``rotation_tol`` of one of the default rotation points
+        (``rotation_points``, see ``get_tile_rotation_points()``). At all other positions, the yaw of a mover may deviate at most
+        ``max_yaw_deviation`` from the nearest multiple of 90 deg.
+
+        :param add_qpos_noise: whether to add Gaussian noise to the qpos of the movers, defaults to True, since it would also occur in a
+            real system
+        :return: True if at least one mover violates the rotation limits, False otherwise
+        """
+        return bool(
+            self.check_mover_rotation(
+                mover_names=self.mover_names,
+                mover_qpos=None,
+                add_qpos_noise=add_qpos_noise,
+                tol=self.rotation_tol,
+                max_yaw_deviation=self.max_yaw_deviation,
+            ).any()
+        )
+
     def _check_for_other_collisions_callback(self) -> tuple[bool, dict[str, bool]]:
         """Check for collisions besides mover and wall collisions, i.e. contacts of the station collision proxies (see
-        ``get_station_proxy_collisions()``). This method has the signature of the corresponding callback of
-        ``BasicMagBotSingleAgentEnv``.
+        ``get_station_proxy_collisions()``) and rotation violations (see ``check_rotation_violation()``), which are treated like
+        collisions. This method has the signature of the corresponding callback of ``BasicMagBotSingleAgentEnv``.
 
         :return:
-            - whether there is a station proxy collision (bool)
-            - a dictionary with the station proxy collision types (see ``get_station_proxy_collisions()``)
+            - whether there is a station proxy collision or a rotation violation (bool)
+            - a dictionary with the station proxy collision types (see ``get_station_proxy_collisions()``) and ``rotation_violation``
         """
         collision_info = self.get_station_proxy_collisions()
-        return collision_info['station_proxy_collision'], collision_info
+        collision_info['rotation_violation'] = self.check_rotation_violation()
+        return collision_info['station_proxy_collision'] or collision_info['rotation_violation'], collision_info
 
     def _check_collisions(self) -> tuple[bool, bool, bool, dict[str, bool]]:
-        """Check for mover, wall and other collisions (station collision proxies) in the current state. Noise is added to the mover
-        positions, since it would also occur in a real system.
+        """Check for mover, wall and other collisions (station collision proxies and rotation violations) in the current state. Noise
+        is added to the mover positions, since it would also occur in a real system.
 
         :return: whether there is a mover collision, a wall collision or another collision (each bool), and a dictionary with the
-            station proxy collision types (see ``get_station_proxy_collisions()``)
+            station proxy collision types and the rotation violation (see ``_check_for_other_collisions_callback()``)
         """
         wall_collision = self.check_wall_collision(
             mover_names=self.mover_names, c_size=self.c_size, add_safety_offset=False, mover_qpos=None, add_qpos_noise=True
@@ -829,16 +872,17 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
 
         :param mover_collision: whether there is a collision between two movers
         :param wall_collision: whether there is a collision between a mover and a wall
-        :param other_collision: whether there is a station proxy collision (already contained in ``collision_info``)
+        :param other_collision: whether there is a station proxy collision or a rotation violation (already contained in
+            ``collision_info``)
         :param achieved_goal: not used in this environment, defaults to None
         :param desired_goal: not used in this environment, defaults to None
-        :param collision_info: a dictionary with the station proxy collision types (see ``get_station_proxy_collisions()``),
-            defaults to None. If None, the station proxy collisions are checked in the current state.
+        :param collision_info: a dictionary with the station proxy collision types and the rotation violation (see
+            ``_check_for_other_collisions_callback()``), defaults to None. If None, both are checked in the current state.
         :return: the info dictionary with keys ``mover_collision``, ``wall_collision``, ``station_proxy_collision``,
-            ``rail_rod_collision`` and ``station_pin_collision`` (bool values)
+            ``rail_rod_collision``, ``station_pin_collision`` and ``rotation_violation`` (bool values)
         """
         if collision_info is None:
-            collision_info = self.get_station_proxy_collisions()
+            collision_info = self._check_for_other_collisions_callback()[1]
         info = {'mover_collision': bool(mover_collision), 'wall_collision': bool(wall_collision)}
         info.update({key: bool(value) for key, value in collision_info.items()})
         return info
@@ -1030,9 +1074,9 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
         render_every_cycle: bool = False,
     ) -> dict[str, Any]:
         """Perform one or multiple simulation steps, including caluclation of mover controls, MuJoCo integrator steps, rendering, and
-        collision checking. The remaining cycles are skipped if a collision is detected. Afterwards, the product is counted and respawned
-        if it came to rest in the bin or outside the bin below the platform heights (see ``num_delivered_products``,
-        ``num_dropped_products``).
+        collision checking. The remaining cycles are skipped if a collision or a rotation violation is detected. Afterwards, the product
+        is counted and respawned if it came to rest in the bin or outside the bin below the platform heights (see
+        ``num_delivered_products``, ``num_dropped_products``).
 
         :param mover_setposes: The desired mover poses (numpy array of shape (num_movers, 6) using Euler angles (xyz) in rad),
             [idx_mover,:]: set pose of mover idx_mover. The movers are controlled directly instead of via the platform set poses, e.g. to
@@ -1077,233 +1121,71 @@ class ReconfigurationTransportEnv(BasicMagBotEnv):
         return info
 
 
-###################################################
-# Scripted transport task                         #
-###################################################
-# Scripted movements of the transport task, used by the demo below and by the tests. Each movement is a linear interpolation of the set
-# poses (one set pose per env step) followed by holding the end pose. The functions return the info dicts of all env steps.
+if __name__ == '__main__':
+    # Minimal demo: the movers (mover idx_c carries connection idx_c) rotate to the docking yaws at their start positions (rotation
+    # points), pick up the MagBot from the station and transport products from the supply rack to the bin until the demo is interrupted
+    # (Ctrl+C). More extensive demos are located in the MagBotSim_Solutions repository.
+    # start positions of the movers in connection order (rotation points) [m]
+    env = ReconfigurationTransportEnv(initial_mover_xy_pos=np.array([[0.72, 0.36], [0.24, 0.36]]))
+    num_cycles = 20
 
-# the movers enter and leave the station along the entry axis (y-axis of the station body frame) from this distance [m]
-STATION_ENTRANCE_DIST = 0.145
-# the movers carry the MagBot this distance out of the station along the take-out axis [m]
-STATION_TAKE_OUT_DIST = 0.25
-# distance between the pre-station points and the staging points, at which the movers rotate in place [m]
-STATION_STAGING_DIST = 0.15
-# on the way to the station, the movers first drive straight up to this lane [m]
-STATION_LANE_Y = 0.28
-DEFAULT_DURATION = 0.75  # [s]
-DEFAULT_HOLD_DURATION = 0.25  # [s]
-# maximum duration for which the platform stays tilted at the bin until the product has left the platform [s]
-DUMP_TIMEOUT = 5.0
-
-
-def _interpolate(start: np.ndarray, end: np.ndarray, duration: float, dt: float) -> list[np.ndarray]:
-    """Linearly interpolate between two set poses, i.e. one set pose per env step (at least the end pose)."""
-    return [start + s * (end - start) for s in np.linspace(0.0, 1.0, max(int(duration / dt), 1))]
-
-
-def move_movers(
-    env: ReconfigurationTransportEnv,
-    start_c: np.ndarray,
-    end_c: np.ndarray,
-    connection_movers: np.ndarray,
-    duration: float = DEFAULT_DURATION,
-    hold_duration: float = DEFAULT_HOLD_DURATION,
-    num_cycles: int = 20,
-) -> list[dict[str, Any]]:
-    """Move the movers linearly from start to end and hold the end pose.
-
-    :param env: the environment
-    :param start_c: the start set poses in connection order (numpy array of shape (num_connections, 6))
-    :param end_c: the end set poses in connection order (numpy array of shape (num_connections, 6))
-    :param connection_movers: the index of the mover for each connection (numpy array of shape (num_connections,))
-    :param duration: the duration of the movement [s], defaults to ``DEFAULT_DURATION``
-    :param hold_duration: the duration for which the end pose is held [s], defaults to ``DEFAULT_HOLD_DURATION``
-    :param num_cycles: the number of control cycles per env step, defaults to 20
-    :return: the info dicts of all env steps
-    """
-    dt = env.cycle_time * num_cycles
-    infos = []
-    for poses_c in _interpolate(start_c, end_c, duration, dt) + _interpolate(end_c, end_c, hold_duration, dt):
-        mover_setposes = np.zeros((env.num_movers, 6))
-        mover_setposes[connection_movers] = poses_c
-        infos.append(env.step(mover_setposes=mover_setposes, num_cycles=num_cycles))
-    return infos
-
-
-def move_magbot(
-    env: ReconfigurationTransportEnv,
-    start: np.ndarray,
-    end: np.ndarray,
-    duration: float = DEFAULT_DURATION,
-    hold_duration: float = DEFAULT_HOLD_DURATION,
-    num_cycles: int = 20,
-    connection_movers: np.ndarray | None = None,
-) -> list[dict[str, Any]]:
-    """Move the platform of the MagBot (carried by the movers) linearly from start to end and hold the end pose.
-
-    :param env: the environment
-    :param start: the start platform set pose (numpy array of shape (6,) or (1, 6))
-    :param end: the end platform set pose (numpy array of shape (6,) or (1, 6))
-    :param duration: the duration of the movement [s], defaults to ``DEFAULT_DURATION``
-    :param hold_duration: the duration for which the end pose is held [s], defaults to ``DEFAULT_HOLD_DURATION``
-    :param num_cycles: the number of control cycles per env step, defaults to 20
-    :param connection_movers: the index of the mover for each connection (numpy array of shape (num_connections,)), defaults to None,
-        i.e. the movers that are attached to the connections (``connection_mover_indices``). Required when the MagBot is taken out of
-        the station, since the rail mounts are only welded to the movers when the movers leave the station.
-    :return: the info dicts of all env steps
-    """
-    if connection_movers is None:
-        connection_movers = env.connection_mover_indices[0]
-    assert (connection_movers != NO_INDEX).all(), 'the MagBot must be carried by the movers'
-    start, end = start.reshape((1, 6)), end.reshape((1, 6))
-    dt = env.cycle_time * num_cycles
-    infos = []
-    for platform_setpose in _interpolate(start, end, duration, dt) + _interpolate(end, end, hold_duration, dt):
-        mover_setposes = np.zeros((env.num_movers, 6))
-        mover_setposes[connection_movers] = env.get_mover_poses_from_magbot_setpose(magbot_setposes=platform_setpose)
-        infos.append(env.step(mover_setposes=mover_setposes, num_cycles=num_cycles))
-    return infos
-
-
-def run_magbot_pickup(env: ReconfigurationTransportEnv, num_cycles: int = 20) -> list[dict[str, Any]]:
-    """Pick up the MagBot from the station with both movers (starting at their start positions), take it out of the station and move
-    it to the supply approach pose (``SUPPLY_APPROACH_PLATFORM_POSE``), at which ``run_transport_cycle()`` starts.
-
-    :param env: the environment (after a reset, i.e. the MagBot is parked in the station and the movers are free)
-    :param num_cycles: the number of control cycles per env step, defaults to 20
-    :return: the info dicts of all env steps
-    """
+    # mover set poses (connection order): in the station, at the station entrances (145 mm along the entry axis of the station), 200 mm
+    # in front of the entrances and at the start positions (with the docking yaws and with a yaw of 0)
     station = env.stations[0]
-    rot_station = station.rotation_matrix_xy()
-    # pick-up: the movers drive to the real positions of the parked rail mounts (connection order)
-    pickup_poses_c = env.station_mover_poses[0].copy()
-    pickup_poses_c[:, :2] = env.get_rail_mount_xy()
-    # station entrances (entry axis = y-axis of the station body frame, each mover enters from the flat side of its rail mount) and
-    # pre-station points (200 mm in front of the entrances in world y)
-    entrance_offsets = np.stack([np.zeros(env.num_connections), STATION_ENTRANCE_DIST * station.MOVER_ENTRY_SIGNS], axis=1) @ rot_station.T
-    entrance_poses_c = pickup_poses_c.copy()
-    entrance_poses_c[:, :2] += entrance_offsets
-    pre_station_poses_c = entrance_poses_c.copy()
-    pre_station_poses_c[:, 1] -= 0.2
-    # the MagBot is taken out of the station along the take-out axis (x-axis of the station body frame)
-    pickup_magbot_pose = env.get_magbot_setpose_from_mover_poses(mover_poses=pickup_poses_c)
-    take_out_poses_c = pickup_poses_c.copy()
-    take_out_poses_c[:, :2] += rot_station @ np.array([STATION_TAKE_OUT_DIST, 0.0])
-    take_out_magbot_pose = env.get_magbot_setpose_from_mover_poses(mover_poses=take_out_poses_c)
-
-    # movers that carry the connections: assigned in the order of the x-positions of the pre-station points, so that the paths of the
-    # movers do not cross
-    connection_movers = np.zeros(env.num_connections, dtype=int)
-    connection_movers[np.argsort(pre_station_poses_c[:, 0])] = np.argsort(env.mover_start_xy_pos[:, 0])
-
-    # all movers start with a yaw of 0, they rotate to the docking yaws on their way to the station
-    initial_poses_c = np.zeros((env.num_connections, 6))
-    initial_poses_c[:, :2] = env.mover_start_xy_pos[connection_movers]
-    initial_poses_c[:, 2] = env.initial_mover_z_pos
-    lane_poses_c = initial_poses_c.copy()
-    lane_poses_c[:, 1] = STATION_LANE_Y
-    # staging points: the pre-station points shifted towards the station anchor (x), where the movers rotate in place between a yaw of 0
-    # and the docking yaws (the pre-station points are too close to the walls)
-    staging_poses_c = pre_station_poses_c.copy()
-    staging_poses_c[:, 0] += STATION_STAGING_DIST * np.sign(station.pos[0] - staging_poses_c[:, 0])
-    staging_yaw0_poses_c = staging_poses_c.copy()
-    staging_yaw0_poses_c[:, 5] = 0.0
-
-    infos = []
-
-    def movers(start_c: np.ndarray, end_c: np.ndarray, duration: float = DEFAULT_DURATION) -> None:
-        infos.extend(move_movers(env, start_c, end_c, connection_movers, duration=duration, num_cycles=num_cycles))
-
-    # 1) the movers drive straight up to the lane, to the staging points, rotate to the docking yaws and drive to the pre-station points
-    movers(initial_poses_c, lane_poses_c)
-    movers(lane_poses_c, staging_yaw0_poses_c)
-    movers(staging_yaw0_poses_c, staging_poses_c, duration=1.0)
-    movers(staging_poses_c, pre_station_poses_c)
-    # 2) the movers drive straight into the station (+y) and enter it along the entry axis (rail mounts still welded to the station)
-    movers(pre_station_poses_c, entrance_poses_c)
-    movers(entrance_poses_c, pickup_poses_c)
-    # 3) the movers take the MagBot out of the station along the take-out axis (rail mounts welded to the movers) and move it to the
-    #    supply approach pose
-    infos.extend(move_magbot(env, pickup_magbot_pose, take_out_magbot_pose, num_cycles=num_cycles, connection_movers=connection_movers))
-    infos.extend(move_magbot(env, take_out_magbot_pose, env.SUPPLY_APPROACH_PLATFORM_POSE, num_cycles=num_cycles))
-    return infos
-
-
-def run_transport_cycle(env: ReconfigurationTransportEnv, num_cycles: int = 20) -> list[dict[str, Any]]:
-    """Transport one product from the supply rack to the bin. The cycle starts and ends at the supply approach pose
-    (``SUPPLY_APPROACH_PLATFORM_POSE``), i.e. the MagBot must be carried by the movers (see ``run_magbot_pickup()``).
-
-    :param env: the environment
-    :param num_cycles: the number of control cycles per env step, defaults to 20
-    :return: the info dicts of all env steps
-    """
-    approach = env.SUPPLY_APPROACH_PLATFORM_POSE
-    # supply: the platform moves under the product, lifts it off the poles and pulls it out of the rack
-    supply = env.SUPPLY_PLATFORM_POSE
+    p_station = env.station_mover_poses[0]
+    p_entrance = p_station.copy()
+    p_entrance[:, :2] += np.stack([np.zeros(env.num_movers), 0.145 * station.MOVER_ENTRY_SIGNS], axis=1) @ station.rotation_matrix_xy().T
+    p_pre_station = p_entrance.copy()
+    p_pre_station[:, 1] -= 0.2
+    p_start_docking = p_station.copy()
+    p_start_docking[:, :2] = env.mover_start_xy_pos
+    p_start = p_start_docking.copy()
+    p_start[:, 5] = 0.0
+    # platform set poses: in the station, taken out of the station by 0.25 m (along the x-axis of the station) and of the transport task
+    p_taken_out = p_station.copy()
+    p_taken_out[:, :2] += station.rotation_matrix_xy() @ np.array([0.25, 0.0])
+    magbot_station = env.get_magbot_setpose_from_mover_poses(mover_poses=p_station)[0]
+    magbot_taken_out = env.get_magbot_setpose_from_mover_poses(mover_poses=p_taken_out)[0]
+    approach, supply, bin_pose = env.SUPPLY_APPROACH_PLATFORM_POSE, env.SUPPLY_PLATFORM_POSE, env.BIN_PLATFORM_POSE
     pick = supply.copy()
-    pick[2] = env.PICK_PLATFORM_Z
+    pick[2] = env.PICK_PLATFORM_Z  # lift the product off the poles of the supply rack
     retract = pick.copy()
-    retract[1] = env.RETRACT_PLATFORM_Y
-    # bin: the MagBot moves sideways to the bin (no turn), moves towards the bottom long side and tilts the platform towards the bin
-    bin_pose = env.BIN_PLATFORM_POSE
+    retract[1] = env.RETRACT_PLATFORM_Y  # pull the product out of the supply rack
     bin_retract = bin_pose.copy()
     bin_retract[1] = env.RETRACT_PLATFORM_Y
     dump = bin_pose.copy()
-    dump[3] = env.DUMP_PLATFORM_A_ROT
+    dump[3] = env.DUMP_PLATFORM_A_ROT  # tilt the platform towards the bin (mover a is at a rotation point)
 
-    def move_segments(segments: list[tuple[np.ndarray, np.ndarray, float, float]]) -> None:
-        for start, end, duration, hold_duration in segments:
-            infos.extend(move_magbot(env, start, end, duration=duration, hold_duration=hold_duration, num_cycles=num_cycles))
+    def move(start: np.ndarray, end: np.ndarray, magbot: bool = False, duration: float = 1.0, hold: float = 0.25) -> None:
+        """Move the movers (or the platform) linearly from start to end and hold the end pose."""
+        dt = env.cycle_time * num_cycles
+        for s in np.concatenate([np.linspace(0.0, 1.0, int(duration / dt)), np.ones(int(hold / dt))]):
+            setposes = start + s * (end - start)
+            if magbot:
+                setposes = env.get_mover_poses_from_magbot_setpose(magbot_setposes=setposes.reshape((1, 6)))
+            info = env.step(mover_setposes=setposes, num_cycles=num_cycles)
+            if any(value for key, value in info.items() if not key.startswith('product_')):
+                print(f'collision or rotation violation: {info}')
 
-    infos = []
-    # to the supply, pick up the product and move to the bin
-    move_segments(
-        [
-            (approach, supply, 1.0, 0.25),
-            (supply, pick, 0.75, 0.25),
-            (pick, retract, 1.0, 0.25),
-            (retract, bin_retract, 1.0, 0.25),
-            (bin_retract, bin_pose, 0.75, 0.25),
-            (bin_pose, dump, 0.75, 0.0),
-        ]
-    )
-    # the platform stays tilted until the product has left the platform (delivered or dropped), since the time until the product tips
-    # over the edge varies (the tilt is only slightly larger than the friction angle)
-    dump_mover_setposes = np.zeros((env.num_movers, 6))
-    dump_mover_setposes[env.connection_mover_indices[0]] = env.get_mover_poses_from_magbot_setpose(magbot_setposes=dump.reshape((1, 6)))
-    for _ in range(0, int(DUMP_TIMEOUT / (env.cycle_time * num_cycles))):
-        infos.append(env.step(mover_setposes=dump_mover_setposes, num_cycles=num_cycles))
-        if infos[-1]['product_delivered'] or infos[-1]['product_dropped']:
-            break
-    # back to the supply approach pose
-    move_segments(
-        [
-            (dump, bin_pose, 0.75, 0.25),
-            (bin_pose, bin_retract, 0.75, 0.25),
-            (bin_retract, approach, 1.0, 0.25),
-        ]
-    )
-    return infos
-
-
-if __name__ == '__main__':
-    # The demo picks up the MagBot from the station and then transports products from the supply rack to the bin next to it (both at
-    # the bottom long side) until the viewer is closed or the demo is interrupted (Ctrl+C). The product is respawned in the supply rack
-    # after each delivery.
-    COLLISION_KEYS = ('mover_collision', 'wall_collision', 'station_proxy_collision')
-
-    def report_collisions(infos: list[dict[str, Any]]) -> None:
-        collisions = sorted({key for info in infos for key in COLLISION_KEYS if info[key]})
-        if collisions:
-            print(f'  collisions: {collisions}')
-
-    env = ReconfigurationTransportEnv(initial_mover_xy_pos=np.array([[0.130, 0.100], [0.860, 0.100]]))
     try:
-        report_collisions(run_magbot_pickup(env))
-        print(f'MagBot picked up, carried by movers: {env.connection_mover_indices[0].tolist()}')
-        while env.render_mode is None or env.window_viewer_is_running():
-            report_collisions(run_transport_cycle(env))
+        # pick up the MagBot and take it out of the station
+        move(p_start, p_start_docking)  # rotate at the rotation points
+        move(p_start_docking, p_pre_station)
+        move(p_pre_station, p_entrance)
+        move(p_entrance, p_station)  # enter the station along the entry axis (rail mounts still welded to the station)
+        move(magbot_station, magbot_taken_out, magbot=True)  # take out the MagBot (rail mounts welded to the movers)
+        move(magbot_taken_out, approach, magbot=True)
+        # transport products from the supply rack to the bin
+        while True:
+            move(approach, supply, magbot=True)  # under the product
+            move(supply, pick, magbot=True)
+            move(pick, retract, magbot=True)
+            move(retract, bin_retract, magbot=True)
+            move(bin_retract, bin_pose, magbot=True)
+            move(bin_pose, dump, magbot=True, hold=3.0)  # tilt and wait until the product has fallen into the bin
+            move(dump, bin_pose, magbot=True)
+            move(bin_pose, bin_retract, magbot=True)
+            move(bin_retract, approach, magbot=True)
             print(f'delivered products: {env.num_delivered_products}, dropped products: {env.num_dropped_products}')
     except KeyboardInterrupt:
         pass

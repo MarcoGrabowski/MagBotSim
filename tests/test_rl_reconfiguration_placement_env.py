@@ -7,11 +7,19 @@ from magbotsim.rl_envs.magbots.reconfiguration_placement_env import Reconfigurat
 
 # Tests of the goal-conditioned MagBot placement task (HER-compatible). All tests that use the env fixture are run for both MagBot types.
 
-COLLISION_KEYS = {'mover_collision', 'wall_collision', 'station_proxy_collision', 'rail_rod_collision', 'station_pin_collision'}
-# initial mover positions in connection order (6D-Platform MagBot: connection 0 (mover b) is parked at the +x side of the station)
+COLLISION_KEYS = {
+    'mover_collision',
+    'wall_collision',
+    'station_proxy_collision',
+    'rail_rod_collision',
+    'station_pin_collision',
+    'rotation_violation',
+}
+# initial mover positions in connection order (6D-Platform MagBot: connection 0 (mover b) is parked at the +x side of the station). All
+# positions are rotation points (tile centers), i.e. the movers can rotate to the docking yaws there.
 INITIAL_MOVER_XY_POS = {
-    'gripper': np.array([[0.250, 0.150], [0.710, 0.150], [0.480, 0.150]]),  # [m]
-    'sixD_platform': np.array([[0.710, 0.150], [0.250, 0.150]]),  # [m]
+    'gripper': np.array([[0.240, 0.120], [0.720, 0.120], [0.480, 0.120]]),  # [m]
+    'sixD_platform': np.array([[0.720, 0.120], [0.240, 0.120]]),  # [m]
 }
 
 
@@ -146,6 +154,10 @@ def test_scripted_pick_and_place(env: ReconfigurationPlacementEnv) -> None:
     goal_setposes = taken_out_setposes.copy()
     goal_setposes[:, :2] += goal_xy - taken_out_setposes[:, :2].mean(axis=0)
 
+    # the movers rotate to the docking yaws at their start positions (rotation points) and drive to the station
+    docking_setposes = env.mover_setposes.copy()
+    docking_setposes[:, 5] = station_setposes[:, 5]
+    drive(env, docking_setposes, speed=0.5)
     drive(env, pre_station_setposes, speed=0.15)
     drive(env, entrance_setposes, speed=0.15)
     drive(env, station_setposes, speed=0.05)

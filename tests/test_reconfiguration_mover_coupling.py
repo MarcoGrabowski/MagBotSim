@@ -14,9 +14,11 @@ from magbotsim.utils.rotations_utils import vec_quat2euler
 NUM_CYCLES = 20
 STATION_POSES = np.array([[0.480, 0.720, 0.01, np.deg2rad(-90)]])  # (x, y, z, yaw) of the station anchor
 NUM_MOVERS = {'gripper': 5, 'sixD_platform': 4}
-# start positions of the movers that do not carry the MagBot (bottom of the table, far enough from the walls to rotate in place)
-PARKING_XY = np.array([[0.14, 0.13], [0.83, 0.13]])  # [m]
-# distance between the pre-station points and the staging points (towards the station anchor), at which the movers rotate in place [m]
+# start positions of the movers that do not carry the MagBot (bottom of the table, rotation points far enough from the walls to rotate
+# in place)
+PARKING_XY = np.array([[0.12, 0.12], [0.84, 0.12]])  # [m]
+# distance between the pre-station points and the staging points (towards the station anchor), at which the movers rotate in place [m].
+# The staging points are moved to the nearest rotation points, since a full rotation is only possible there.
 STAGING_DIST = 0.15
 
 
@@ -26,14 +28,21 @@ STAGING_DIST = 0.15
 
 
 class Scene:
-    """Reconfiguration env with extra movers: the movers that carry the MagBot (``connection_movers``, connection order) start at the
-    staging points (yaw 0), all other movers at the parking positions. Provides the mover set poses of the station choreography (see the
-    example in reconfiguration_env.py) in connection order.
+    """Reconfiguration env with extra movers: the movers that carry the MagBot (``connection_movers``, connection order) drive to the
+    staging points (yaw 0), all other movers wait at the parking positions. Provides the mover set poses of the station choreography (see
+    the example in reconfiguration_env.py) in connection order.
+
+    :param env_kwargs: additional keyword arguments of the ``ReconfigurationEnv``
     """
 
-    def __init__(self, magbot_type: str, connection_movers: list[int]) -> None:
+    def __init__(self, magbot_type: str, connection_movers: list[int], **env_kwargs) -> None:
         self.env = ReconfigurationEnv(
-            magbot_types=(magbot_type,), num_movers=NUM_MOVERS[magbot_type], station_poses=STATION_POSES, seed=0, render_mode=None
+            magbot_types=(magbot_type,),
+            num_movers=NUM_MOVERS[magbot_type],
+            station_poses=STATION_POSES,
+            seed=0,
+            render_mode=None,
+            **env_kwargs,
         )
         env = self.env
         self.connection_movers = np.array(connection_movers)
@@ -46,6 +55,13 @@ class Scene:
         p['pre_station'][:, 1] -= 0.2
         p['staging'] = p['pre_station'].copy()
         p['staging'][:, 0] += STAGING_DIST * np.sign(station.pos[0] - p['staging'][:, 0])
+        # start positions of the movers that carry the MagBot (yaw 0): close to the staging points, but outside the keep-out boxes of the
+        # parked rail mounts, which are used to validate start positions
+        p['start'] = p['staging'].copy()
+        p['start'][:, 5] = 0.0
+        # staging points: nearest rotation points
+        dists = np.linalg.norm(p['staging'][:, np.newaxis, :2] - env.rotation_points[np.newaxis, :, :], axis=2)
+        p['staging'][:, :2] = env.rotation_points[np.argmin(dists, axis=1)]
         p['staging_yaw0'] = p['staging'].copy()
         p['staging_yaw0'][:, 5] = 0.0
         center = p['station'].copy()
@@ -58,11 +74,13 @@ class Scene:
         other_movers = [idx_mover for idx_mover in range(env.num_movers) if idx_mover not in connection_movers]
         start_xy = np.zeros((env.num_movers, 2))
         start_xy[other_movers] = PARKING_XY[: len(other_movers)]
-        start_xy[self.connection_movers] = p['staging'][:, :2]
+        start_xy[self.connection_movers] = p['start'][:, :2]
         env.reset_scene(mover_start_xy_pos=start_xy)
         self.setposes = np.zeros((env.num_movers, 6))
         self.setposes[:, :2] = start_xy
         self.setposes[:, 2] = env.initial_mover_z_pos
+        # the movers that carry the MagBot drive to the staging points
+        self.move(p['start'], p['staging_yaw0'], duration=0.5)
 
     def close(self) -> None:
         """Close the env."""
@@ -206,7 +224,9 @@ def test_movers_swap_connections(magbot_type: str, movers_1: list[int], movers_2
 
 
 def test_gripper_rotation_control_switching() -> None:
-    scene = Scene(magbot_type='gripper', connection_movers=[4, 1, 3])
+    # Changing the gripper rotations and the finger distance rotates the attached movers, which is only possible at rotation points. The
+    # rotation limits are disabled for this test (the yaw deviation from the nearest multiple of 90 deg is at most 45 deg).
+    scene = Scene(magbot_type='gripper', connection_movers=[4, 1, 3], max_yaw_deviation=np.pi / 4)
     env = scene.env
     magbots = env.magbots
     assert isinstance(magbots, GripperMagBotsAPM4330)
