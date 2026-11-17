@@ -29,6 +29,15 @@ General
       ``save_model_xml()``, ``model_xml_path``).
 3. ``MoverImpedanceController.set_joint_mask()`` optionally sets the controls of disabled DoFs to zero (``data``) and no longer validates
    the joint mask.
+4. New ``ReconfigurationTransportEnv`` (``envs_without_rl_api``), a standalone sibling of ``ReconfigurationEnv`` with the same tile
+   layout, profile frame and station, two movers and one 6D-Platform MagBot:
+    - Infinite transport task: the movers pick up the MagBot from the station, take products from the supply rack of the 6D-Platform
+      application example and drop them into its bin by tilting the platform. The supply rack and the bin are located next to each
+      other at the bottom long side, i.e. the MagBot does not have to turn.
+    - A product that rests in the bin is counted as delivered (``num_delivered_products``), a product that rests outside the bin below
+      the platform heights as dropped (``num_dropped_products``). In both cases, it is respawned in the supply rack
+      (``respawn_product()``). ``step()`` reports both events in the info dict (``product_delivered``, ``product_dropped``).
+    - Scripted demo movements (``run_magbot_pickup()``, ``run_transport_cycle()``), used by the demo of the script and by the tests.
 
 Pre-Release v1.4.0a4 (2026-11-12)
 ---------------------------------

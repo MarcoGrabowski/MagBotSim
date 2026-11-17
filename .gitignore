@@ -215,3 +215,5 @@ docs/stl_list.rst
 MUJOCO_LOG.TXT
 # model XMLs saved by the reconfiguration environment next to its script (ReconfigurationEnv.save_model_xml())
 magbotsim/envs_without_rl_api/magbots/reconfiguration_env_*.xml
+# model XML saved by the reconfiguration transport environment next to its script (ReconfigurationTransportEnv.save_model_xml())
+magbotsim/envs_without_rl_api/magbots/reconfiguration_transport_env.xml
